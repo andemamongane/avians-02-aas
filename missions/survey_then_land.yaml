@@ -1,0 +1,25 @@
+# The flagship STL mission. The power lines (nofly_1) sit on the straight line
+# from the pad to field A, and `land` flies straight home, so the agent must
+# detour on the way out AND on the way back.
+# "Landed" is alt <= 1, not 0: the simulated altitude estimate drifts by up to
+# ~0.7 m over a flight, so a landed drone can read anywhere in about -0.7..0.7.
+name: survey_then_land
+prompt_file: survey_then_land.txt
+map: maps/field_01.yaml
+spec: >-
+  G[0,240] !in(nofly_1)
+  & F[0,120] G[0,10] in(survey_a)
+  & F[0,240] (in(home_pad) & alt <= 1)
+show_spec: true
+max_steps: 20
+max_wall_s: 300
+description: Survey field A for 10 s without crossing the power lines, then land.
+
+dry_run_script:
+  - [takeoff, {altitude: 5}]
+  - [check_path, {east: 19, north: 25}]
+  - [reposition, {east: 0, north: 16, altitude: 5}]
+  - [goto_region, {region: survey_a, altitude: 5}]
+  - [hover, {duration: 12}]
+  - [reposition, {east: 0, north: 20, altitude: 5}]
+  - [land, {}]

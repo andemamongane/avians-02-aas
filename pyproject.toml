@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "avians"
+version = "0.1.0"
+description = "LLM tool-calling flight through the aerial-autonomy-stack, scored against STL mission specs"
+requires-python = ">=3.10"
+dependencies = ["pyyaml"]
+# anthropic is installed in the image; not a hard dep so tests run without it.
+
+[project.optional-dependencies]
+agent = ["anthropic>=0.40"]
+plot = ["matplotlib>=3.6", "numpy"]
+dev = ["pytest"]
+
+[project.scripts]
+avians = "avians.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

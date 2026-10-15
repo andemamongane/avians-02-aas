@@ -1,0 +1,29 @@
+# The aerial-autonomy-stack interface, in ONE place. Names are relative to the
+# drone's namespace, exactly as AAS's px4_interface creates them
+# (external/aerial-autonomy-stack/aircraft/aircraft_ws/src/autopilot_interface).
+namespace: /Drone1             # AAS runs drone N as /DroneN on ROS domain N
+
+# autopilot_interface_msgs
+takeoff_action: takeoff_action
+land_action: land_action
+orbit_action: orbit_action
+set_reposition: set_reposition
+set_speed: set_speed
+
+# PX4 telemetry, as bridged by AAS's dds_topics.yaml (PX4 v1.17.0)
+local_position: fmu/out/vehicle_local_position_v1
+status: fmu/out/vehicle_status_v1
+# AAS's dds_topics.yaml does not bridge battery_status, so under AAS the agent
+# sees battery as unknown and the battery floor in limits.yaml never triggers.
+battery: fmu/out/battery_status_v1
+
+# Seconds to wait for telemetry and for the action servers at startup.
+connect_timeout_s: 60
+
+# rosbag2 flight recorder (full topic names)
+record:
+  - /Drone1/fmu/out/vehicle_local_position_v1
+  - /Drone1/fmu/out/vehicle_global_position
+  - /Drone1/fmu/out/vehicle_status_v1
+  - /Drone1/fmu/in/vehicle_command
+  - /Drone1/fmu/out/vehicle_command_ack

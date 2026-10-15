@@ -1,0 +1,28 @@
+# A small test field. Coordinates are metres EAST and NORTH of the launch point.
+name: field_01
+description: Flat open ground around the launch pad. No obstacles; regions are virtual.
+regions:
+  - id: survey_a
+    name: Survey field A
+    kind: goal
+    description: Open field north-east of the pad. Inspect it from 8 m or lower.
+    polygon: [[12, 18], [26, 18], [26, 32], [12, 32]]
+    altitude: [3, 8]
+
+  - id: nofly_1
+    name: Power lines
+    kind: no_fly
+    description: Overhead lines on the direct line from the pad to field A. Do not enter at any altitude.
+    polygon: [[4, 8], [18, 8], [18, 13], [4, 13]]
+
+  - id: survey_b
+    name: Survey field B
+    kind: goal
+    description: Smaller field north-west of the pad.
+    polygon: [[-22, 14], [-12, 14], [-12, 24], [-22, 24]]
+
+  - id: home_pad
+    name: Launch pad
+    kind: landing
+    description: The launch and landing pad. The drone always lands here.
+    polygon: [[-2, -2], [2, -2], [2, 2], [-2, 2]]

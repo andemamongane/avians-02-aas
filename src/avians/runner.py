@@ -1,0 +1,146 @@
+"""The mission runner: a tool-use loop with any pilot (Claude, DeepSeek, Codex...).
+
+Deliberately a plain loop, with no agent framework. The serialized messages ARE
+the training data, so nothing may sit between the model and the log.
+
+Three independent caps end an episode cleanly, each catching a different
+failure: step cap (model loops), wall-clock cap (something hangs), token cap
+(runaway cost). Whichever trips is recorded in meta.json as terminated_by.
+"""
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from .maps import Map
+from .schema import TOOL_SPECS
+from .tools import ToolLayer
+
+BASE_PROMPT = """You are piloting a quadrotor drone through a small set of tools that command its autopilot.
+
+Frame and units: positions are metres relative to the launch point: east, north,
+and altitude ABOVE the launch point (always positive). Times are seconds from the
+start of the mission; every tool result reports the mission time.
+There is no camera and no obstacle sensing: you know your own state and the map.
+
+Rules:
+- Call takeoff before anything else.
+- One tool call at a time. Wait for the result before deciding the next step.
+- Tool results tell you whether the action arrived, timed out, failed, or was
+  rejected. A rejection includes the reason; adapt rather than repeating the call.
+- land flies back to the launch point at the current altitude and lands there.
+  Call it when the mission is complete, then stop.
+- If you are unsure or something is wrong, call abort.
+- The safety system enforces only a geofence and altitude/speed limits. It does
+  NOT know about the map regions: respecting them is your responsibility."""
+
+SPEC_GUIDE = """The mission's requirements in signal temporal logic (STL). Your flight is scored
+against this formula; times are seconds from the start of the mission.
+  in(r)       the drone is inside region r (and within its altitude band, if any)
+  G[a,b] p    p holds at every moment from a to b seconds
+  F[a,b] p    p holds at some moment between a and b seconds
+  p U[a,b] q  q becomes true between a and b seconds, and p holds until then
+  ! & | ->    not, and, or, implies
+Requirements:
+  {spec}"""
+
+
+def build_system_prompt(mission_map: Map | None, spec: str | None) -> str:
+    parts = [BASE_PROMPT]
+    if mission_map is not None and mission_map.regions:
+        parts.append("Mission map. Region vertices are (east, north) in metres:\n"
+                     + mission_map.describe())
+    if spec:
+        parts.append(SPEC_GUIDE.format(spec=spec))
+    parts.append("Be efficient: every extra call costs time and battery.")
+    return "\n\n".join(parts)
+
+
+@dataclass
+class RunCaps:
+    max_steps: int = 25
+    max_wall_s: float = 300.0
+    max_tokens_total: int = 300_000
+
+
+@dataclass
+class RunResult:
+    steps: int = 0
+    terminated_by: str = "model_stop"
+    usage: dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
+    error: str | None = None
+
+
+class MissionRunner:
+    """Flies one mission with any pilot (see pilots.py). The log is in one
+    canonical format whichever provider flew, so episodes are comparable."""
+
+    def __init__(self, pilot, tools: ToolLayer, logger, model: str,
+                 caps: RunCaps | None = None, system_prompt: str | None = None):
+        self.pilot = pilot
+        self.tools = tools
+        self.log = logger
+        self.model = model
+        self.caps = caps or RunCaps()
+        self.system_prompt = system_prompt or build_system_prompt(None, None)
+
+    # ------------------------------------------------------------------
+    def run(self, mission_name: str, mission_prompt: str, mission_cfg: dict) -> RunResult:
+        result = RunResult()
+        self.log.system(self.system_prompt, TOOL_SPECS)
+        self.log.mission(mission_name, mission_prompt, mission_cfg)
+        self.pilot.start(self.system_prompt, TOOL_SPECS, mission_prompt)
+
+        messages: list[dict[str, Any]] = [{"role": "user", "content": mission_prompt}]
+        t0 = time.time()
+
+        while True:
+            if result.steps >= self.caps.max_steps:
+                result.terminated_by = "step_cap"
+                break
+            if time.time() - t0 > self.caps.max_wall_s:
+                result.terminated_by = "wall_clock_cap"
+                break
+            total_tokens = result.usage["input_tokens"] + result.usage["output_tokens"]
+            if total_tokens > self.caps.max_tokens_total:
+                result.terminated_by = "token_cap"
+                break
+
+            self.log.request(messages, self.model)
+            try:
+                reply = self.pilot.step()
+            except Exception as e:                  # network/rate-limit/overload/bad request
+                result.terminated_by = "api_error"
+                result.error = f"{type(e).__name__}: {e}"
+                self.log.note("api error", error=result.error)
+                break
+
+            result.usage["input_tokens"] += reply.usage["input_tokens"]
+            result.usage["output_tokens"] += reply.usage["output_tokens"]
+            self.log.response(reply.content, reply.stop_reason, reply.usage)
+
+            messages.append({"role": "assistant", "content": reply.content})
+
+            tool_uses = reply.tool_uses
+            if not tool_uses:
+                result.terminated_by = "model_stop"
+                break
+
+            tool_results, native_results = [], []
+            for block in tool_uses:
+                name, args, uid = block["name"], block.get("input", {}), block["id"]
+                self.log.tool_call(name, args, uid)
+                obs = self.tools.dispatch(name, args)
+                text = obs.to_text()
+                self.log.observation(obs.to_dict(), text, uid)
+                tool_results.append(
+                    {"type": "tool_result", "tool_use_id": uid, "content": text}
+                )
+                native_results.append((uid, text))
+                result.steps += 1
+
+            self.pilot.add_tool_results(native_results)
+            messages.append({"role": "user", "content": tool_results})
+
+        return result

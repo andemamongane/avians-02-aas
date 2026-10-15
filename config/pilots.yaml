@@ -1,0 +1,53 @@
+# The AI agents that can fly. Choose with:  avians fly <mission> --pilot deepseek
+# Model ids change over time; this file is the only place to update them.
+# Keys come from .env (key_env), never from this file.
+default: claude
+
+# The pilots `avians showcase` compares, in this order.
+showcase: [claude, deepseek, codex]
+
+pilots:
+  claude:
+    label: Claude Sonnet 5.5
+    provider: anthropic
+    model: claude-sonnet-5-5
+    key_env: ANTHROPIC_API_KEY
+  claude-opus:
+    label: Claude Opus 5.5
+    provider: anthropic
+    model: claude-opus-5-5
+    key_env: ANTHROPIC_API_KEY
+  claude-haiku:
+    label: Claude Haiku 5.5
+    provider: anthropic
+    model: claude-haiku-5-5
+    key_env: ANTHROPIC_API_KEY
+
+  # DeepSeek's OpenAI-compatible API. Thinking mode is on by default; its
+  # reasoning_content is passed back every turn, as DeepSeek requires.
+  deepseek:
+    label: DeepSeek V4 Pro
+    provider: openai_chat
+    model: deepseek-v4-pro
+    base_url: https://api.deepseek.com
+    key_env: DEEPSEEK_API_KEY
+  deepseek-flash:
+    label: DeepSeek V4.1 Flash
+    provider: openai_chat
+    model: deepseek-flash
+    base_url: https://api.deepseek.com
+    key_env: DEEPSEEK_API_KEY
+
+  # The model behind OpenAI Codex, called directly through the Responses API
+  # with the same tools and prompt as every other pilot (not the Codex CLI).
+  codex:
+    label: Codex (GPT-6.1 Sol)
+    provider: openai_responses
+    model: gpt-6.1-sol
+    key_env: OPENAI_API_KEY
+    reasoning_effort: medium
+  codex-luna:
+    label: Codex (GPT-6 Luna)
+    provider: openai_responses
+    model: gpt-6-luna
+    key_env: OPENAI_API_KEY

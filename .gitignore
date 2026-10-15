@@ -1,0 +1,19 @@
+# secrets
+.env
+*.env
+!.env.example
+
+# episode data
+data/episodes/*
+!data/episodes/.gitkeep
+*.mcap
+data/showcase/
+*.db3
+
+# python
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+
+.DS_Store

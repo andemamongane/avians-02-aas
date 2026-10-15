@@ -1,0 +1,15 @@
+# Safety envelope: GLOBAL limits only. The arbiter refuses anything outside it
+# and tells the model why. Mission regions (no-fly zones etc.) are deliberately
+# not here: respecting them is what the STL score measures.
+geofence_radius_m: 50.0
+max_altitude_m: 30.0
+min_altitude_m: 1.0
+max_speed_ms: 8.0
+min_battery_pct: 20.0      # only applies when the autopilot reports battery (AAS does not)
+max_hover_s: 60.0
+max_orbit_s: 120.0
+
+# skill-layer behaviour
+arrive_radius_m: 1.0       # PX4 reposition settles within ~0.5 m in calm air; wind needs slack
+action_timeout_s: 60
+land_timeout_s: 120        # land flies home first, then descends

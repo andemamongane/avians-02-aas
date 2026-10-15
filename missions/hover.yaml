@@ -1,0 +1,15 @@
+# Smallest end-to-end check: no map, a spec on altitude only.
+name: hover
+prompt_file: hover.txt
+spec: F[0,40] G[0,10] (alt >= 4 & alt <= 6) & G[0,120] alt <= 8
+max_steps: 10
+max_wall_s: 180
+description: Take off to 5 m, hold for 10 s, land.
+
+# Flown instead of the model by `avians fly missions/hover.yaml --dry-run`.
+# It also exercises orbit, which the model is not asked to use here.
+dry_run_script:
+  - [takeoff, {altitude: 5}]
+  - [hover, {duration: 12}]
+  - [orbit, {east: 0, north: 0, altitude: 5, radius: 4, duration: 15}]
+  - [land, {}]

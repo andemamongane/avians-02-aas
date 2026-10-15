@@ -1,0 +1,3 @@
+[submodule "external/aerial-autonomy-stack"]
+	path = external/aerial-autonomy-stack
+	url = https://github.com/JacopoPan/aerial-autonomy-stack.git

@@ -1,0 +1,27 @@
+name: avians-02            # explicit, so it never collides with avians-01 (also in a docker/ folder)
+services:
+  avians:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: avians-02:latest
+    container_name: avians-02
+    env_file:                  # ANTHROPIC_API_KEY lives here, never in the image
+      - path: ../.env
+        required: false        # fresh clones still open; only `fly` needs the key
+    environment:
+      PX4_VERSION: v1.17.0
+      PX4_MSGS_REF: 86d8239e962f6939e05c3737784f60c02fa884db
+      PX4_SIM_MODEL: sihsim_quadx
+      AVIANS_DATA: /workspace/data
+    volumes:
+      - ../src:/workspace/src           # live code edits, no rebuild
+      - ../config:/workspace/config
+      - ../missions:/workspace/missions
+      - ../maps:/workspace/maps
+      - ../tests:/workspace/tests
+      - ../data:/workspace/data         # episodes land on the host
+    working_dir: /workspace
+    command: ["tail", "-f", "/dev/null"]
+    stdin_open: true
+    tty: true

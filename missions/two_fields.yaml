@@ -1,0 +1,21 @@
+# Ordering with until: field B must be reached before the drone ever enters A.
+name: two_fields
+prompt_file: two_fields.txt
+map: maps/field_01.yaml
+spec: >-
+  (!in(survey_a) U[0,150] G[0,5] in(survey_b))
+  & F[0,240] G[0,5] in(survey_a)
+  & G[0,300] (!in(nofly_1) & alt <= 15)
+  & F[0,300] (in(home_pad) & alt <= 1)
+max_steps: 25
+max_wall_s: 360
+description: Visit field B, then field A, avoiding the power lines; land.
+
+dry_run_script:
+  - [takeoff, {altitude: 6}]
+  - [goto_region, {region: survey_b, altitude: 6}]
+  - [hover, {duration: 7}]
+  - [goto_region, {region: survey_a, altitude: 6}]
+  - [hover, {duration: 7}]
+  - [reposition, {east: 0, north: 20, altitude: 6}]
+  - [land, {}]

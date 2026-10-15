@@ -1,0 +1,3 @@
+Survey field B first, staying inside it for at least 5 seconds, and do not enter
+field A before that. Then survey field A for at least 5 seconds. Keep out of the
+power-line zone and stay at or below 15 metres for the whole mission, then land.

@@ -1,0 +1,8 @@
+# Dev Containers only. initializeCommand (devcontainer.json) builds the image on
+# the host first, so drop `build:` here and the extension just runs that image.
+# If the extension builds it instead, it writes a Dockerfile to a temp dir
+# outside the repo, and Compose 5 (buildx bake) refuses to read it:
+#   additional privileges requested: pass "--allow=fs.read=/var/folders/..."
+services:
+  avians:
+    build: !reset null
