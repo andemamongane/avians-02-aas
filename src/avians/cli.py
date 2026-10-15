@@ -336,10 +336,17 @@ def cmd_showcase(args: argparse.Namespace) -> int:
     names = {yaml.safe_load(m.read_text())["name"]: m for m in mission_files}
 
     if args.fly:
+        cfg = pilots_cfg.get("pilots", {})
+        keyless = [p for p in pilots if cfg.get(p, {}).get("key_env")
+                   and not os.environ.get(cfg[p]["key_env"])]
+        if keyless:
+            print("[showcase] not flying " + ", ".join(
+                f"{p} (no {cfg[p]['key_env']} in .env)" for p in keyless)
+                + "; their existing flights are still filmed")
         have = _latest_flights(pilots, include_dry=False)
         for name, path in names.items():
             for p in pilots:
-                if (name, p) in have and not args.refly:
+                if p in keyless or ((name, p) in have and not args.refly):
                     continue
                 print(f"\n[showcase] flying {name} with {p}")
                 cmd = [sys.executable, "-m", "avians.cli", "fly", str(path), "--pilot", p]
