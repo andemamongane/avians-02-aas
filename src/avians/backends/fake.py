@@ -10,6 +10,10 @@ same commands are accepted and rejected in the same states:
   - reposition / orbit / land only while hovering or orbiting
   - land flies home at the given altitude, then descends and disarms
   - orbit keeps circling until another command replaces it
+  - follow (plan-ahead control) behaves like AAS's offboard action with the
+    avians trajectory controller: accepted from hover; a new trajectory while
+    following replaces the reference without leaving offboard; at the end of
+    the trajectory the drone holds its last point; end_follow returns to hover
 """
 from __future__ import annotations
 
@@ -36,6 +40,8 @@ class FakeBackend:
         self._target: tuple[float, float, float] | None = None
         self._orbit: tuple[float, float, float, float] | None = None   # e, n, alt, r
         self._handle: ActionHandle | None = None
+        self._traj = None                # trajectory.Trajectory while following
+        self._traj_t0 = 0.0
         self._last_update = self.now()
         self.connected = False
 
@@ -110,12 +116,38 @@ class FakeBackend:
         self._handle = h
         return h
 
+    def follow(self, traj) -> ActionHandle:
+        h = ActionHandle(kind="follow", target=traj.pos[-1])
+        if self.fsm not in ("hover", "offboard"):
+            return h.fail("offboard rejected: the autopilot interface is not hovering")
+        self._integrate()
+        self.fsm, self.state.mode = "offboard", "offboard"
+        self._orbit = self._target = None
+        self._traj, self._traj_t0 = traj, self.now()
+        return h.succeed("following the trajectory")
+
+    def end_follow(self) -> ActionHandle:
+        h = ActionHandle(kind="end_follow")
+        if self.fsm != "offboard":
+            return h.fail("not in offboard")
+        self._integrate()
+        s = self.state
+        self._traj = None
+        self.fsm, s.mode = "hover", "auto_loiter"
+        self._target = (s.east, s.north, s.alt)
+        s.v_east = s.v_north = s.v_up = 0.0
+        return h.succeed("offboard ended, hovering")
+
     # --- kinematics
     def _integrate(self) -> None:
         t = self.now()
         dt = max(0.0, t - self._last_update)
         self._last_update = t
         s = self.state
+        if self._traj is not None:              # tracks the reference exactly
+            (s.east, s.north, s.alt), (s.v_east, s.v_north, s.v_up) = \
+                self._traj.sample(t - self._traj_t0)
+            return
         if dt == 0:
             return
         if self._orbit is not None:

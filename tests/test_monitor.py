@@ -23,7 +23,12 @@ from conftest import REPO
 
 SURVEY_SPEC = ("G[0,240] !in(nofly_1) "
                "& F[0,120] (G[0,10] in(survey_a) & F[0,120] (in(home_pad) & alt <= 1))")
-# Straight from the pad to field A: through the power lines.
+# Straight from the pad to field A: through the power lines (step, then plan).
+THROUGH_NOFLY_PLAN = [("takeoff", {"altitude": 5}),
+                      ("fly_plan", {"segments": [
+                          {"type": "waypoint", "east": 15, "north": 25, "altitude": 5},
+                          {"type": "hold", "duration": 12}, {"type": "land"}]}),
+                      ("wait", {"seconds": 120, "until": "landed"})]
 THROUGH_NOFLY = [("takeoff", {"altitude": 5}),
                  ("reposition", {"east": 15, "north": 25, "altitude": 5}),
                  ("hover", {"duration": 12}),
@@ -145,7 +150,8 @@ def test_threaded_monitor_samples_while_the_model_thinks(field_map):
     assert mon._thread is None
 
 
-def test_stopped_flight_is_plotted_with_its_landing(clock, tmp_path, monkeypatch):
+@pytest.mark.parametrize("control", ["step", "plan"])
+def test_stopped_flight_is_plotted_with_its_landing(clock, tmp_path, monkeypatch, control):
     """A4: plots, summary and video see the stop, and the monitor's landing
     counts as landed even though the model never called land."""
     pytest.importorskip("matplotlib")
@@ -156,12 +162,14 @@ def test_stopped_flight_is_plotted_with_its_landing(clock, tmp_path, monkeypatch
 
     mission = yaml.safe_load((REPO / "missions" / "survey_then_land.yaml").read_text())
     mission["dry_run_script"] = [[n, a] for n, a in THROUGH_NOFLY]
+    mission["dry_run_plan"] = [[n, a] for n, a in THROUGH_NOFLY_PLAN]
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / mission["prompt_file"]).write_text("fly")
     path = tmp_path / "through.yaml"
     path.write_text(yaml.safe_dump(mission))
     monkeypatch.setattr(cli, "DATA", tmp_path / "episodes")
-    assert cli.main(["fly", str(path), "--backend", "fake", "--dry-run", "--no-plots"]) == 0
+    assert cli.main(["fly", str(path), "--backend", "fake", "--dry-run", "--no-plots",
+                     "--control", control]) == 0
     ep = tmp_path / "episodes" / "ep_0001"
 
     f = load_episode(ep)

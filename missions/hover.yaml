@@ -13,3 +13,11 @@ dry_run_script:
   - [hover, {duration: 12}]
   - [orbit, {east: 0, north: 0, altitude: 5, radius: 4, duration: 15}]
   - [land, {}]
+
+# Flown by `--dry-run` under plan-ahead control (the default).
+dry_run_plan:
+  - [takeoff, {altitude: 5}]
+  - [fly_plan, {segments: [{type: hold, duration: 12},
+                           {type: orbit, east: 0, north: 0, altitude: 5, radius: 4, turns: 1},
+                           {type: land}]}]
+  - [wait, {seconds: 120, until: landed}]

@@ -79,7 +79,7 @@ class FlightData:
 
     @property
     def dense(self) -> bool:
-        return self.source == "rosbag2"
+        return self.source in ("rosbag2", "agent state stream")
 
 
 # ---------------------------------------------------------------- loading
@@ -95,6 +95,10 @@ def load_episode(episode_dir: Path) -> FlightData:
 
     state, setpoint, battery = _from_observations(records, calls, t0)
     source = "agent observations"
+    if (d / "state.jsonl").exists():                 # the monitor's state stream
+        stream = _from_state_stream(d / "state.jsonl", records, t0)
+        if stream is not None:
+            state, source = stream, "agent state stream"
     origin = meta.get("frame_origin_ned") or (0.0, 0.0, 0.0)
     bag = _read_bag(d / "bag", t0, origin) if (d / "bag" / "metadata.yaml").exists() else None
     if bag is not None:
@@ -137,6 +141,30 @@ def _monitor_stop(records: list[dict], t0: float) -> dict | None:
         "reason": ended.get("reason"),
         "landed": bool(landed and landed.get("status") == "arrived"),
     }
+
+
+def flow_metrics(f: FlightData, still: float = 0.5, moving: float = 1.5) -> dict | None:
+    """How the drone flew, not just where: share of airborne time spent
+    hovering, mean airborne speed, and mid-air stops (speed falling below
+    `still` after exceeding `moving`). Stop-and-go flight scores badly here."""
+    if len(f.t) < 3:
+        return None
+    dt = np.diff(f.t)
+    air = (f.z[1:] > 0.3) & np.isfinite(f.speed[1:])
+    t_air = float(dt[air].sum())
+    if t_air <= 0:
+        return None
+    sp = f.speed[1:][air]
+    stops, was_moving = 0, False
+    for v in sp:
+        if v > moving:
+            was_moving = True
+        elif v < still and was_moving:
+            stops, was_moving = stops + 1, False
+    return {"hover_fraction": round(float(dt[air][sp < still].sum() / t_air), 3),
+            "mean_airborne_speed_ms": round(float((sp * dt[air]).sum() / t_air), 2),
+            "mid_air_stops": stops,
+            "airborne_s": round(t_air, 1)}
 
 
 def decided_at(online: list[dict]) -> list[dict]:
@@ -234,6 +262,38 @@ def _read_bag(bag_dir: Path, t0: float, origin=(0.0, 0.0, 0.0)):
     return (p[:, 0], p[:, 1], p[:, 2], p[:, 3], p[:, 4]), (b[:, 0], b[:, 1])
 
 
+def _from_state_stream(path: Path, records: list[dict], t0: float):
+    """state.jsonl (sampled by the online monitor), plus the noted states of
+    the monitor's own landing, which can come after the stream stops."""
+    rows = [(r["t"], r["north"], r["east"], r["alt"], r["speed"]) for r in load_jsonl(path)]
+    if len(rows) < 2:
+        return None
+    end = rows[-1][0]
+    for r in records:
+        if r["kind"] == "note" and "state" in r and r["t_wall"] - t0 > end:
+            o = r["state"]
+            rows.append((r["t_wall"] - t0, o["north"], o["east"], o["alt"],
+                         math.sqrt(o["v_east"] ** 2 + o["v_north"] ** 2 + o["v_up"] ** 2)))
+    p = np.array(sorted(rows), dtype=float)
+    return p[:, 0], p[:, 1], p[:, 2], p[:, 3], p[:, 4]
+
+
+def _plan_setpoints(records: list[dict], t0: float):
+    """Plan-ahead control: the accepted plans as the commanded path, each one
+    until the next replaced it."""
+    plans = [(r["t_wall"] - t0 - r["observation"].get("plan_age_s", 0.0),
+              r["observation"]["plan_path"]) for r in records
+             if r["kind"] == "observation" and r["observation"].get("plan_path")]
+    sp = []
+    for k, (start, path) in enumerate(plans):
+        until = plans[k + 1][0] if k + 1 < len(plans) else math.inf
+        for t, e, n, a in path:
+            if start + t < until:
+                sp.append((start + t, n, e, a))
+        sp.append((min(until, start + path[-1][0]), np.nan, np.nan, np.nan))
+    return sp
+
+
 def _from_observations(records: list[dict], calls: list[ToolCall], t0: float):
     obs = [r for r in records if r["kind"] == "observation"]
     # notes with a state: the monitor's stop and landing, which no observation records
@@ -255,7 +315,8 @@ def _from_observations(records: list[dict], calls: list[ToolCall], t0: float):
             sp.append((c.t_end, *c.target))
         elif c.tool == "land":
             sp.append((c.t_start, np.nan, np.nan, np.nan))
-    s = np.array(sp, dtype=float).reshape(-1, 4)
+    sp += _plan_setpoints(records, t0)
+    s = np.array(sorted(sp, key=lambda r: r[0]), dtype=float).reshape(-1, 4)
 
     b = np.array([(r["t_wall"] - t0, r["observation"]["battery_pct"]) for r in obs
                   if r["observation"].get("battery_pct") is not None], dtype=float).reshape(-1, 2)
@@ -275,7 +336,11 @@ def compute_metrics(f: FlightData) -> dict[str, Any]:
     air_t = f.t[airborne]
 
     land = next((c for c in reversed(f.calls) if c.tool == "land"), None)
-    landed = bool(land and land.status == "arrived") or bool(f.stop and f.stop["landed"])
+    # a land call that arrived (step), the monitor's landing, or (plan-ahead,
+    # where landing is a plan segment) a flight that ended on the ground at rest
+    on_ground = bool(len(f.z) and (f.z > 0.3).any() and f.z[-1] < 0.5 and f.speed[-1] < 0.3)
+    landed = (bool(land and land.status == "arrived") or bool(f.stop and f.stop["landed"])
+              or (f.meta.get("control") == "plan" and on_ground))
     flight_calls = [c for c in f.calls if c.tool in FLIGHT_TOOLS]
     safety_rejections = [c for c in f.calls if c.status in ("rejected", "blocked")]
 
@@ -331,6 +396,7 @@ def compute_metrics(f: FlightData) -> dict[str, Any]:
         "model_time_s": round(sum(b - a for a, b in f.thinking), 1),
         "tokens": {"input": usage.get("input_tokens", 0),
                    "output": usage.get("output_tokens", 0)},
+        "flow": flow_metrics(f),
         "stl": f.stl,
         "online": {"policy": (f.meta.get("early_stop") or {}).get("policy"),
                    "stop": f.stop, "decided_at": decided_at(f.online)} if f.online else None,

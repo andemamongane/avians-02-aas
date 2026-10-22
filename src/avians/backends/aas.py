@@ -176,6 +176,19 @@ class AasBackend(Node):
         goal.landing_altitude = float(alt)
         return self._send(self.land_client, goal, h)
 
+    # Plan-ahead control. To be built on the Linux machine: one offboard_action
+    # per flight (controller "avians_trajectory", a controller added to AAS's
+    # offboard_control package) that tracks the latest trajectory published on
+    # a topic; a new trajectory replaces the reference; end_follow needs a small
+    # AAS patch to finish the offboard action into Loiter without the abort climb.
+    def follow(self, traj) -> ActionHandle:
+        return ActionHandle(kind="follow").fail(
+            "plan-ahead control is not available on AAS yet (needs the avians "
+            "trajectory controller); fly this mission with --control step")
+
+    def end_follow(self) -> ActionHandle:
+        return ActionHandle(kind="end_follow").fail("plan-ahead control is not available on AAS yet")
+
     def orbit(self, east: float, north: float, alt: float, radius: float) -> ActionHandle:
         h = ActionHandle(kind="orbit", target=(east, north, alt))
         goal = Orbit.Goal()

@@ -1,20 +1,48 @@
 # Safety envelope: GLOBAL limits only. The arbiter refuses anything outside it
 # and tells the model why. Mission regions (no-fly zones etc.) are deliberately
 # not here: respecting them is what the STL score measures.
-geofence_radius_m: 50.0
-max_altitude_m: 30.0
-min_altitude_m: 1.0
-max_speed_ms: 8.0
+#
+# The flight envelope comes in named profiles. A mission picks one with
+# `envelope:`; otherwise `envelope` below applies. A profile's keys override
+# the defaults that follow it.
+envelope: aggressive
+
+envelopes:
+  # What step-by-step flight was tuned for: PX4's conservative defaults.
+  standard:
+    geofence_radius_m: 50.0
+    max_altitude_m: 30.0
+    min_altitude_m: 1.0
+    max_speed_ms: 8.0
+    max_accel_ms2: 3.0       # PX4 MPC_ACC_HOR
+    max_climb_ms: 3.0        # MPC_Z_VEL_MAX_UP
+    max_descent_ms: 1.5      # MPC_Z_VEL_MAX_DN
+    corner_radius_m: 4.0
+  # Plan-ahead flight for the x500 (thrust/weight ~2, so ~60 deg of tilt holds
+  # altitude). To be validated in Gazebo; the matching PX4 parameters are
+  # MPC_XY_VEL_MAX 15, MPC_ACC_HOR_MAX 7, MPC_TILTMAX_AIR 45,
+  # MPC_Z_VEL_MAX_UP 4, MPC_Z_VEL_MAX_DN 3, MPC_JERK_MAX 20.
+  aggressive:
+    geofence_radius_m: 150.0
+    max_altitude_m: 40.0
+    min_altitude_m: 2.0
+    max_speed_ms: 15.0
+    max_accel_ms2: 7.0       # ~35 deg of tilt; turns and braking share it
+    max_climb_ms: 4.0
+    max_descent_ms: 3.0
+    corner_radius_m: 6.0     # widest fillet on a fly-through corner
+
 min_battery_pct: 20.0      # only applies when the autopilot reports battery (AAS does not)
 max_hover_s: 60.0
 max_orbit_s: 120.0
+max_plan_s: 600.0          # longest single flight plan
 
-# skill-layer behaviour
+# skill-layer behaviour (step-by-step tools)
 arrive_radius_m: 1.0       # PX4 reposition settles within ~0.5 m in calm air; wind needs slack
 action_timeout_s: 60
 land_timeout_s: 120        # land flies home first, then descends
 
 # online STL monitor (missions choose early_stop: off | violated | decided)
-monitor_speed_margin: 1.5  # the monitor assumes the drone never exceeds max_speed_ms x this;
+monitor_speed_margin: 1.3  # the monitor assumes the drone never exceeds max_speed_ms x this;
                            # too tight and it can stop a flight that would have passed
 monitor_eval_s: 1.0        # seconds between robustness-interval updates

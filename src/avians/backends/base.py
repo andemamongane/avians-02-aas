@@ -5,7 +5,9 @@ back. It contains NO policy: no arrival detection, no timeouts, no limits.
 Those live in skills.py and safety.py so that every backend behaves identically.
 
 The commands mirror the aerial-autonomy-stack's autopilot_interface:
-takeoff_action, set_reposition (+ set_speed), orbit_action, land_action.
+takeoff_action, set_reposition (+ set_speed), orbit_action, land_action, and
+for plan-ahead control offboard_action with the avians trajectory controller
+(follow / end_follow).
 `hold` is a reposition to the current position: AAS has no hold command, and
 cancelling an AAS action makes it climb to its abort altitude (100 m by default).
 
@@ -81,3 +83,7 @@ class Backend(Protocol):
     def orbit(self, east: float, north: float, alt: float, radius: float) -> ActionHandle: ...
     def hold(self) -> ActionHandle: ...
     def land(self, alt: float) -> ActionHandle: ...
+    # plan-ahead control: fly a trajectory.Trajectory continuously; a new one
+    # replaces the reference; end_follow hands back to hover
+    def follow(self, traj) -> ActionHandle: ...
+    def end_follow(self) -> ActionHandle: ...

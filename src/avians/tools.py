@@ -13,13 +13,16 @@ from .backends.base import VehicleState
 from .maps import Map
 from .safety import SafetyArbiter
 from .schema import (
-    BLOCKED, FAILED, OK, REJECTED,
+    BLOCKED, FAILED, OK, PLAN_TOOL_SPECS, REJECTED, TOOL_SPECS,
     Observation, ToolArgError, validate_tool_args,
 )
 from .skills import ActionOutcome, Skills
 
 
 class ToolLayer:
+    """Step-by-step control: every flight tool blocks until the drone arrives."""
+    specs = TOOL_SPECS
+
     def __init__(self, skills: Skills, arbiter: SafetyArbiter, mission_map: Map | None = None):
         self.skills = skills
         self.arbiter = arbiter
@@ -48,6 +51,20 @@ class ToolLayer:
         except Exception as e:                      # never let it escape
             traceback.print_exc()
             return self._observe(FAILED, f"{type(e).__name__}: {e}")
+
+    # --- hooks for the runner (same on both tool layers) ----------------------
+    def set_interrupt(self, fn) -> None:
+        self.skills.interrupt = fn
+
+    def tick(self) -> None:
+        """Between model turns: nothing flies on its own in step mode."""
+
+    def emergency_land(self):
+        """The online monitor ended the mission: hold, then land.
+        Returns (status, reason, final state)."""
+        self.skills.abort()
+        out = self.skills.land()
+        return out.status, out.reason, out.state
 
     def _resolve(self, name: str, args: dict) -> dict:
         """goto_region -> a concrete point inside the region (checked by safety
@@ -143,3 +160,84 @@ class ToolLayer:
                 for rid, r in self.map.regions.items()
             }
         return obs
+
+
+class PlanToolLayer(ToolLayer):
+    """Plan-ahead control: the pilot commits to flight plans that the drone
+    flies continuously (executor.py). Every call returns at once; events since
+    the pilot's last call arrive on the next observation."""
+    specs = PLAN_TOOL_SPECS
+
+    def __init__(self, executor, mission_map: Map | None = None):
+        self.ex = executor
+        self.arbiter = executor.arbiter
+        self.map = mission_map
+        self.backend = executor.backend
+        self.t_start = self.backend.now()
+        self.call_count = 0
+
+    def set_interrupt(self, fn) -> None:
+        self.ex.interrupt = fn
+
+    def tick(self) -> None:
+        self.ex.tick()
+
+    def emergency_land(self):
+        return self.ex.emergency_land()
+
+    def finish(self):
+        """After the pilot's last turn: let a running plan play out."""
+        return self.ex.finish()
+
+    def dispatch(self, name: str, args: dict) -> Observation:
+        self.call_count += 1
+        try:
+            clean = validate_tool_args(name, args, PLAN_TOOL_SPECS)
+        except ToolArgError as e:
+            return self._plan_obs(REJECTED, str(e))
+        try:
+            if name == "get_state":
+                self.ex.tick()
+                return self._plan_obs(OK, "")
+            if name == "check_path":
+                obs = self._check_path(clean["east"], clean["north"])
+                return self._plan_obs(obs.status, obs.reason, obs.info)
+            if name == "takeoff":
+                result = self.ex.takeoff(clean["altitude"])
+            elif name == "fly_plan":
+                result = self.ex.fly_plan(clean["segments"], clean.get("mode", "replace"))
+            elif name == "wait":
+                result = self.ex.wait(clean["seconds"], clean.get("until", "event"))
+            elif name == "hold":
+                result = self.ex.hold()
+            elif name == "land":
+                result = self.ex.land()
+            else:                                     # unreachable: validated above
+                return self._plan_obs(FAILED, f"unhandled tool {name}")
+        except Exception as e:                        # never let it escape
+            traceback.print_exc()
+            return self._plan_obs(FAILED, f"{type(e).__name__}: {e}")
+        status, reason, info = result
+        return self._plan_obs(status, reason, info)
+
+    def _plan_obs(self, status: str, reason: str, info: str = "") -> Observation:
+        obs = self._observe(status, reason)
+        obs.info = info
+        obs.events = self.ex.drain()
+        obs.plan_status = self.ex.status()
+        started = self.ex.started_plan()
+        if started is not None:                  # for plots; never sent to the model
+            obs.plan_path, obs.plan_age_s = _path_for_plots(started[0]), round(started[1], 3)
+        return obs
+
+
+def _path_for_plots(traj, spacing: float = 2.0) -> list[list[float]]:
+    """The accepted plan every ~2 m: [seconds into the plan, east, north, alt]."""
+    out, last = [], None
+    for t, p in zip(traj.t, traj.pos):
+        if last is None or sum((a - b) ** 2 for a, b in zip(p, last)) >= spacing ** 2:
+            out.append([round(t, 2), round(p[0], 2), round(p[1], 2), round(p[2], 2)])
+            last = p
+    end = traj.pos[-1]
+    out.append([round(traj.t[-1], 2), round(end[0], 2), round(end[1], 2), round(end[2], 2)])
+    return out

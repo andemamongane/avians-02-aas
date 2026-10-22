@@ -52,13 +52,14 @@ Inside the container (the VS Code terminal, or `./scripts/shell.sh`):
 avians doctor                                     # PX4 topics + AAS actions up?
 avians check missions/survey_then_land.yaml       # print exactly what the agent will see
 avians fly missions/survey_then_land.yaml --dry-run   # scripted plan, no API calls
+avians fly missions/survey_then_land.yaml --dry-run --control step   # the step-by-step baseline
 avians fly missions/survey_then_land.yaml         # Claude flies it
 avians fly missions/survey_then_land.yaml --pilot deepseek   # or codex, claude-opus, ...
 avians score 4                                    # re-score episode 4 against its spec
 avians plot --all                                 # figures for every episode
 avians video 4                                    # episode 4 as an MP4
 avians showcase --fly                             # every mission x pilot, filmed
-pytest                                            # 83 offline tests
+pytest                                            # 125 offline tests
 ```
 
 Keep the laptop awake during a flight. If the host sleeps, the simulator
@@ -108,7 +109,8 @@ spec: >-
   & F[0,120] (G[0,10] in(survey_a) & F[0,120] (in(home_pad) & alt <= 1))
 show_spec: true          # false = the agent gets only the prompt
 early_stop: violated     # off | violated (default) | decided; see "Online scoring"
-dry_run_script: [...]    # flown by --dry-run instead of the model
+dry_run_plan: [...]      # flown by --dry-run instead of the model (plan-ahead)
+dry_run_script: [...]    # the same, for --control step
 ```
 
 A map is a list of polygons in **metres east and north of the launch point**:
@@ -142,9 +144,36 @@ Times are seconds from mission start. Robustness > 0 means satisfied with that
 margin. Flights shorter than the spec's horizon are padded by holding the last
 state (the drone stays where it landed); the report says how much.
 
-## Tools the agent gets
+## Tools the agent gets: plan-ahead and step-by-step
 
-They mirror AAS's interface, in AAS's frame (east, north, altitude above launch).
+Pilots fly under one of two control modes (`control:` in the mission, or
+`avians fly --control plan|step`).
+
+**Plan-ahead (default).** The pilot commits to a whole flight plan, and the
+drone flies it continuously while the pilot keeps thinking. Every call returns
+at once; what happened in between arrives as events. Waypoints are flown
+through, corners are rounded, and the drone slows only where a turn or a
+required stop demands it. A new plan replaces the old one without stopping.
+
+| Tool | What it does |
+|---|---|
+| `takeoff(altitude)` | starts the climb; a plan sent now starts when it completes |
+| `fly_plan(segments, mode?)` | commit to `waypoint` / `region` / `orbit` / `survey` / `hold` / `land` segments; `replace` (default) or `append`; returns a preview (length, duration, segment times, regions the path crosses) |
+| `wait(seconds, until?)` | let time pass until the next event, the plan completing, or landing |
+| `hold()` | brake and hover |
+| `land()` | straight home at the current altitude, then land |
+| `check_path(east, north)`, `get_state()` | map and state, no command |
+
+How fast and hard the drone may fly is the **flight envelope** in
+`config/limits.yaml`: `aggressive` (default; 15 m/s, 7 m/s², 45° tilt, a 150 m
+geofence, to be validated in Gazebo) or `standard` (PX4's defaults). A mission
+can choose one with `envelope:`. Plans are checked point by point against it.
+On AAS, plan-ahead control needs the avians trajectory controller, which is
+not written yet: until then it runs on the fake backend only.
+
+**Step-by-step (the baseline).** Each tool mirrors one AAS call and blocks until
+the drone arrives, so the drone hovers whenever the model thinks. Kept for
+comparison.
 
 | Tool | AAS call | Returns when |
 |---|---|---|
@@ -170,6 +199,7 @@ data/episodes/ep_0004/
 ├── map.yaml           # copy of the mission map
 ├── stl.json           # robustness overall and per clause
 ├── stl_online.jsonl   # robustness interval per second during the flight (online monitor)
+├── state.jsonl        # the vehicle state as the monitor sampled it (the trace when there is no bag)
 ├── meta.json          # spec, model, PX4 / px4_msgs / AAS commit, frame origin, usage
 ├── adp.json           # ADP-style action/observation trajectory
 └── plots/             # ground track with regions, altitude, timeline, summary.md

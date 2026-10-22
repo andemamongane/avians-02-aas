@@ -20,3 +20,13 @@ dry_run_script:
   - [hover, {duration: 7}]
   - [reposition, {east: 0, north: 20, altitude: 6}]
   - [land, {}]
+
+dry_run_plan:
+  - [takeoff, {altitude: 6}]
+  - [fly_plan, {segments: [{type: region, region: survey_b, altitude: 6},
+                           {type: hold, duration: 6},
+                           {type: region, region: survey_a, altitude: 6},
+                           {type: hold, duration: 6},
+                           {type: waypoint, east: 0, north: 20, altitude: 6},
+                           {type: land}]}]
+  - [wait, {seconds: 240, until: landed}]

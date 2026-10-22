@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # --- status codes ----------------------------------------------------------
 # Failures are OBSERVATIONS, never exceptions: the model must be able to see a
@@ -80,8 +80,16 @@ class Observation:
     inside: list[str] = field(default_factory=list)
     region_distance_m: dict[str, float] = field(default_factory=dict)
 
-    # tool-specific result text (e.g. what check_path found)
+    # tool-specific result text (e.g. what check_path found, a plan preview)
     info: str = ""
+
+    # plan-ahead control: what the plan is doing, what happened since the
+    # pilot's last call, and the accepted plan's path for plots (never sent
+    # to the model: [seconds into the plan, east, north, alt] every ~2 m)
+    plan_status: str = ""
+    events: list[str] = field(default_factory=list)
+    plan_path: list[list[float]] = field(default_factory=list)
+    plan_age_s: float = 0.0                # how long that plan had been flying
 
     # perception: always empty in this repo. Kept so perception episodes later
     # stay schema-compatible.
@@ -100,6 +108,10 @@ class Observation:
         """The exact string handed to the model. Keep it terse: every episode
         re-sends the whole history, so verbosity costs tokens quadratically."""
         lines = [f"status: {self.status}" + (f" ({self.reason})" if self.reason else "")]
+        if self.events:
+            lines.append("events since your last call: " + "; ".join(self.events))
+        if self.plan_status:
+            lines.append(f"plan: {self.plan_status}")
         if self.info:
             lines.append(self.info)
         lines.append(
@@ -260,19 +272,128 @@ TOOL_SPECS: list[dict[str, Any]] = [
 ]
 
 TOOL_NAMES = tuple(t["name"] for t in TOOL_SPECS)
-FLIGHT_TOOLS = ("takeoff", "reposition", "goto_region", "orbit", "hover", "land")
+
+# --- plan-ahead tools ---------------------------------------------------------
+# The pilot commits to a whole flight plan; the drone flies it continuously
+# while the pilot keeps thinking. Calls about the plan return at once.
+_SEGMENT = {
+    "type": "object",
+    "description": (
+        "One part of the plan. type is one of: "
+        "waypoint (east, north, altitude: fly THROUGH this point without stopping), "
+        "region (region, altitude: fly through a point well inside a map region), "
+        "orbit (east, north, altitude, radius, turns, direction cw|ccw: circle a centre), "
+        "survey (region, altitude, spacing: lawnmower rows covering a region), "
+        "hold (duration: stop at the previous point and hover that many seconds), "
+        "land (fly straight to the launch point at the current altitude and land; must be last). "
+        "speed (m/s) optionally caps the leg arriving at the segment; otherwise "
+        "the drone flies as fast as the flight envelope and the turns allow."
+    ),
+    "properties": {
+        "type": {"type": "string",
+                 "enum": ["waypoint", "region", "orbit", "survey", "hold", "land"]},
+        "east": _EAST, "north": _NORTH, "altitude": _ALT, "speed": _SPEED,
+        "region": {"type": "string", "description": "Region id from the mission map."},
+        "radius": {"type": "number", "description": "Orbit radius in metres."},
+        "turns": {"type": "number", "description": "Orbit turns (default 1)."},
+        "direction": {"type": "string", "enum": ["cw", "ccw"]},
+        "spacing": {"type": "number", "description": "Survey row spacing in metres (default 5)."},
+        "duration": {"type": "number", "description": "Hold time in seconds."},
+    },
+    "required": ["type"],
+}
+
+PLAN_TOOL_SPECS: list[dict[str, Any]] = [
+    TOOL_SPECS[0],                                   # get_state
+    {
+        "name": "takeoff",
+        "description": (
+            "Arm the drone and climb vertically to the given altitude above the "
+            "launch point. Returns at once; the climb takes a few seconds. Send "
+            "fly_plan straight away: it starts the moment the climb completes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"altitude": _ALT},
+            "required": ["altitude"],
+        },
+    },
+    {
+        "name": "fly_plan",
+        "description": (
+            "Commit to a flight plan: an ordered list of segments that the drone "
+            "flies continuously, rounding corners and slowing only where turns "
+            "require it. Returns at once with a preview (length, duration, when "
+            "each segment completes, which map regions the path passes through); "
+            "the drone is already flying it. mode 'replace' (default) abandons "
+            "the current plan and starts this one from where the drone is, "
+            "keeping its momentum; 'append' adds these segments after the rest "
+            "of the current plan."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "segments": {"type": "array", "items": _SEGMENT,
+                             "description": "The plan, in order."},
+                "mode": {"type": "string", "enum": ["replace", "append"]},
+            },
+            "required": ["segments"],
+        },
+    },
+    {
+        "name": "wait",
+        "description": (
+            "Let time pass while the drone flies, without commanding anything. "
+            "Returns at the first event (a segment completed, a region entered or "
+            "left), when the plan completes, or when the drone has landed, "
+            "depending on 'until' (default 'event'), and after 'seconds' at most."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "seconds": {"type": "number", "description": "Longest wait in seconds."},
+                "until": {"type": "string", "enum": ["event", "plan_complete", "landed"]},
+            },
+            "required": ["seconds"],
+        },
+    },
+    {
+        "name": "hold",
+        "description": (
+            "Abandon the plan: brake along the current direction and hover where "
+            "the drone comes to a stop."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "land",
+        "description": (
+            "Abandon the plan, fly straight to the launch point at the current "
+            "altitude and land. If that straight line must avoid a region, plan "
+            "the route home yourself with fly_plan, ending with a land segment."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    next(t for t in TOOL_SPECS if t["name"] == "check_path"),
+]
+FLIGHT_TOOLS = ("takeoff", "reposition", "goto_region", "orbit", "hover", "land",
+                "fly_plan", "hold", "wait")
 
 
-def validate_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
+def validate_tool_args(name: str, args: dict[str, Any],
+                       specs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Type/range check arguments before anything touches the vehicle.
 
     Returns normalized args. Raises ToolArgError with a message written for the
-    model to read and act on. Region ids are checked against the map in tools.py.
+    model to read and act on. Region ids are checked against the map in tools.py;
+    plan segments in trajectory.expand.
     """
-    if name not in TOOL_NAMES:
-        raise ToolArgError(f"unknown tool '{name}'; available: {', '.join(TOOL_NAMES)}")
+    specs = specs or TOOL_SPECS
+    names = [t["name"] for t in specs]
+    if name not in names:
+        raise ToolArgError(f"unknown tool '{name}'; available: {', '.join(names)}")
 
-    spec = next(t for t in TOOL_SPECS if t["name"] == name)
+    spec = next(t for t in specs if t["name"] == name)
     props = spec["input_schema"]["properties"]
     required = spec["input_schema"].get("required", [])
 
@@ -294,12 +415,17 @@ def validate_tool_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 raise ToolArgError(f"argument '{key}' must be a number, got {value!r}")
         elif expected == "string":
             out[key] = str(value)
+            enum = props[key].get("enum")
+            if enum and out[key] not in enum:
+                raise ToolArgError(f"argument '{key}' must be one of {', '.join(enum)}")
+        elif expected == "array" and not isinstance(value, list):
+            raise ToolArgError(f"argument '{key}' must be a list")
         else:
             out[key] = value
 
     if "altitude" in out and out["altitude"] <= 0:
         raise ToolArgError("altitude must be positive: it is metres above the launch point")
-    for key in ("duration", "radius", "speed"):
+    for key in ("duration", "radius", "speed", "seconds"):
         if key in out and out[key] <= 0:
             raise ToolArgError(f"{key} must be positive")
 

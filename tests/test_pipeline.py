@@ -159,24 +159,26 @@ def test_system_prompt_has_map_and_spec(field_map):
 
 
 # --- whole pipeline -----------------------------------------------------------
-def _fly_dry_run(tmp_path, monkeypatch, mission: str) -> tuple:
+def _fly_dry_run(tmp_path, monkeypatch, mission: str, control: str = "plan") -> tuple:
     monkeypatch.setattr(cli, "DATA", tmp_path / "episodes")
     rc = cli.main(["fly", str(REPO / "missions" / mission), "--backend", "fake",
-                   "--dry-run", "--no-plots"])
+                   "--dry-run", "--no-plots", "--control", control])
     episode = tmp_path / "episodes" / "ep_0001"
     return rc, episode
 
 
+@pytest.mark.parametrize("control", ["plan", "step"])
 @pytest.mark.parametrize("mission", ["hover.yaml", "survey_then_land.yaml", "two_fields.yaml"])
-def test_dry_run_missions_satisfy_their_specs(clock, tmp_path, monkeypatch, mission):
-    """Each mission's dry_run_script is a correct plan: flown on the fake
-    backend it must satisfy the mission's own STL spec."""
+def test_dry_run_missions_satisfy_their_specs(clock, tmp_path, monkeypatch, mission, control):
+    """Each mission's dry-run (dry_run_plan, dry_run_script) is a correct
+    plan: flown on the fake backend it must satisfy the mission's STL spec."""
     pytest.importorskip("numpy")
-    rc, episode = _fly_dry_run(tmp_path, monkeypatch, mission)
+    rc, episode = _fly_dry_run(tmp_path, monkeypatch, mission, control)
     assert rc == 0
     assert validate_episode(episode) == []
     meta = json.loads((episode / "meta.json").read_text())
     assert meta["schema_version"] == SCHEMA_VERSION and meta["dry_run"]
+    assert meta["control"] == control
     stl = json.loads((episode / "stl.json").read_text())
     assert stl["satisfied"], stl
 

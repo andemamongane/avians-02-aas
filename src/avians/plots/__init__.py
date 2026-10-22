@@ -59,6 +59,12 @@ def _summary_md(f, m: dict, headline: str) -> str:
             lines += ["", f"The flight ended at {stl['flight_end_s']} s; the last state was "
                           f"held for {stl['padded_s']} s to cover the spec's "
                           f"{stl['horizon_s']:g} s horizon."]
+    flow = m.get("flow")
+    if flow:
+        lines += ["", "## Flight flow", "",
+                  f"- Hovering {flow['hover_fraction'] * 100:.0f}% of {flow['airborne_s']} s "
+                  f"airborne; mean airborne speed {flow['mean_airborne_speed_ms']} m/s; "
+                  f"{flow['mid_air_stops']} mid-air stops"]
     online = m.get("online")
     if online:
         stop = online["stop"]

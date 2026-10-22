@@ -48,14 +48,54 @@ Requirements:
   {spec}"""
 
 
-def build_system_prompt(mission_map: Map | None, spec: str | None) -> str:
-    parts = [BASE_PROMPT]
+PLAN_PROMPT = """You are piloting a quadrotor drone by planning its flight. You command it with
+flight plans, not single moves.
+
+Frame and units: positions are metres relative to the launch point: east, north,
+and altitude ABOVE the launch point (always positive). Times are seconds from the
+start of the mission; every tool result reports the mission time.
+There is no camera and no obstacle sensing: you know your own state and the map.
+
+How control works:
+- The drone flies your current plan continuously while you think. Every tool
+  returns at once; what happened since your last call (segments completed,
+  regions entered or left, the plan completing, landing) arrives as events.
+- Think ahead. Send the whole route in one fly_plan. Waypoints are flown
+  THROUGH, not stopped at: the planner rounds the corners and slows only where
+  a turn demands it. Stop (hold) only where the mission needs the drone to be
+  stationary.
+- Fly decisively. The flight envelope allows up to {speed:g} m/s and
+  {accel:g} m/s^2 of acceleration; the planner uses all of it unless you cap a
+  leg's speed. Fast, smooth, efficient flight is the goal.
+- To change course, send a new fly_plan: it replaces the old one from wherever
+  the drone is, keeping its momentum. To extend a plan, use mode "append".
+- While a plan runs, use wait to let time pass until the next event instead of
+  polling get_state.
+- Call takeoff first; you can send fly_plan right away. End the mission with a
+  plan whose last segment is land, routed by you around regions you must avoid,
+  then wait until the drone has landed, then stop.
+- The safety system enforces only a {geofence:g} m geofence around the launch
+  point, an altitude band of {floor:g}-{ceiling:g} m and the flight envelope. It
+  does NOT know about the map regions: respecting them is your responsibility."""
+
+
+def build_system_prompt(mission_map: Map | None, spec: str | None, control: str = "step",
+                        limits=None) -> str:
+    if control == "plan":
+        from .safety import Limits
+        L = limits or Limits()
+        parts = [PLAN_PROMPT.format(speed=L.max_speed_ms, accel=L.max_accel_ms2,
+                                    geofence=L.geofence_radius_m, floor=L.min_altitude_m,
+                                    ceiling=L.max_altitude_m)]
+    else:
+        parts = [BASE_PROMPT]
     if mission_map is not None and mission_map.regions:
         parts.append("Mission map. Region vertices are (east, north) in metres:\n"
                      + mission_map.describe())
     if spec:
         parts.append(SPEC_GUIDE.format(spec=spec))
-    parts.append("Be efficient: every extra call costs time and battery.")
+    if control != "plan":
+        parts.append("Be efficient: every extra call costs time and battery.")
     return "\n\n".join(parts)
 
 
@@ -92,20 +132,41 @@ class MissionRunner:
     # ------------------------------------------------------------------
     def run(self, mission_name: str, mission_prompt: str, mission_cfg: dict) -> RunResult:
         result = RunResult()
-        self.log.system(self.system_prompt, TOOL_SPECS)
+        self.log.system(self.system_prompt, self._specs())
         self.log.mission(mission_name, mission_prompt, mission_cfg)
         if self.monitor is not None:
             self.monitor.start()
-            self.tools.skills.interrupt = self.monitor.poll
+            self.tools.set_interrupt(self.monitor.poll)
         try:
             self._loop(result, mission_prompt)
+            if not (self.monitor and self.monitor.terminated_by):
+                self._finish_plan(result)
         finally:
             if self.monitor is not None:
-                self.tools.skills.interrupt = None
+                self.tools.set_interrupt(None)
                 if self.monitor.terminated_by:
                     self._land_after_stop()
                 self.monitor.close()
         return result
+
+    def _specs(self) -> list[dict]:
+        return getattr(self.tools, "specs", TOOL_SPECS)
+
+    def _finish_plan(self, result: RunResult) -> None:
+        """Plan-ahead control: the pilot may stop talking while the drone still
+        flies the plan it committed to (typically ending with a landing). Let it
+        finish, still under the monitor; logged as notes."""
+        finish = getattr(self.tools, "finish", None)
+        if finish is None:
+            return
+        out = finish()
+        if out is None:
+            return
+        status, reason, st = out
+        if self.monitor is not None and self.monitor.terminated_by:
+            result.terminated_by = self.monitor.terminated_by
+        self.log.note("the drone finished the pilot's plan", status=status, reason=reason,
+                      state=_state(st))
 
     def _stopped(self, result: RunResult) -> bool:
         if self.monitor is None or self.monitor.poll() is None:
@@ -117,19 +178,18 @@ class MissionRunner:
         """The monitor ended the mission: hold, then land. Not a model action, so
         it is logged as notes, never as tool calls."""
         self.monitor.disarm()
-        skills = self.tools.skills
-        st = skills.backend.get_state()
+        st = self.tools.backend.get_state()
         self.log.note("stl monitor ended the mission", reason=self.monitor.stop_reason,
                       report=self.monitor.last, state=_state(st))
         if not st.armed:
             return
-        skills.abort()
-        out = skills.land()
-        self.log.note("monitor landed the drone", status=out.status, reason=out.reason,
-                      elapsed_s=round(out.elapsed, 1), state=_state(out.state))
+        t0 = time.time()
+        status, reason, final = self.tools.emergency_land()
+        self.log.note("monitor landed the drone", status=status, reason=reason,
+                      elapsed_s=round(time.time() - t0, 1), state=_state(final))
 
     def _loop(self, result: RunResult, mission_prompt: str) -> None:
-        self.pilot.start(self.system_prompt, TOOL_SPECS, mission_prompt)
+        self.pilot.start(self.system_prompt, self._specs(), mission_prompt)
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": mission_prompt}]
         t0 = time.time()
@@ -148,6 +208,7 @@ class MissionRunner:
                 result.terminated_by = "token_cap"
                 break
 
+            self.tools.tick()                       # plan mode: events while it flew
             self.log.request(messages, self.model)
             try:
                 reply = self.pilot.step()

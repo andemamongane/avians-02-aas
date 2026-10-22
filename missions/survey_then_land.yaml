@@ -24,3 +24,13 @@ dry_run_script:
   - [hover, {duration: 12}]
   - [reposition, {east: 0, north: 20, altitude: 5}]
   - [land, {}]
+
+# The same route as one plan, flown through without stopping except to survey.
+dry_run_plan:
+  - [takeoff, {altitude: 5}]
+  - [fly_plan, {segments: [{type: waypoint, east: 0, north: 16, altitude: 5},
+                           {type: region, region: survey_a, altitude: 5},
+                           {type: hold, duration: 11},
+                           {type: waypoint, east: 0, north: 20, altitude: 5},
+                           {type: land}]}]
+  - [wait, {seconds: 180, until: landed}]

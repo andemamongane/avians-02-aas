@@ -39,7 +39,8 @@ class OnlineMonitor:
     def __init__(self, spec: str, mission_map: Map | None, backend,
                  policy: str = "violated", future: FutureBounds | None = None,
                  eval_every_s: float = 1.0, dt: float = 0.1,
-                 log_path: Path | None = None, threaded: bool = False, hz: float = 10.0):
+                 log_path: Path | None = None, threaded: bool = False, hz: float = 10.0,
+                 state_path: Path | None = None):
         if policy not in POLICIES:
             raise ValueError(f"early_stop must be one of {', '.join(POLICIES)}, not '{policy}'")
         self.spec = parse(spec)
@@ -59,6 +60,8 @@ class OnlineMonitor:
         self._last_eval = -float("inf")
         self._lock = threading.Lock()
         self._log = log_path.open("a", encoding="utf-8") if log_path else None
+        # every sample, for plots and scoring when there is no rosbag (fake backend)
+        self._state = state_path.open("a", encoding="utf-8") if state_path else None
         self._thread: threading.Thread | None = None
         self._running = False
         self._armed = True
@@ -78,8 +81,9 @@ class OnlineMonitor:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
-        if self._log is not None and not self._log.closed:
-            self._log.close()
+        for f in (self._log, self._state):
+            if f is not None and not f.closed:
+                f.close()
 
     def disarm(self) -> None:
         """Keep scoring, but stop interrupting (the runner is landing)."""
@@ -110,6 +114,10 @@ class OnlineMonitor:
                 return
             tr.t.append(t), tr.east.append(st.east), tr.north.append(st.north)
             tr.alt.append(st.alt), tr.speed.append(st.speed)
+            if self._state is not None:
+                self._state.write(json.dumps({
+                    "t": round(t, 3), "east": round(st.east, 3), "north": round(st.north, 3),
+                    "alt": round(st.alt, 3), "speed": round(st.speed, 3)}) + "\n")
             if t - self._last_eval >= self.eval_every_s:
                 self._last_eval = t
                 self._evaluate()

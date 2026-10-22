@@ -25,11 +25,29 @@ class Limits:
     min_battery_pct: float = 20.0
     max_hover_s: float = 60.0
     max_orbit_s: float = 120.0
+    # plan-ahead flight (trajectory.Envelope)
+    max_accel_ms2: float = 3.0
+    max_climb_ms: float = 3.0
+    max_descent_ms: float = 1.5
+    corner_radius_m: float = 4.0
+    max_plan_s: float = 600.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "Limits":
         known = {k: d[k] for k in cls.__dataclass_fields__ if k in d}
         return cls(**known)
+
+
+def resolve(cfg: dict, envelope: str | None = None) -> dict:
+    """limits.yaml with one envelope profile applied: a flat dict."""
+    name = envelope or cfg.get("envelope")
+    profiles = cfg.get("envelopes", {})
+    if name is not None and name not in profiles:
+        raise ValueError(f"unknown envelope '{name}'; known: {', '.join(profiles) or 'none'}")
+    flat = {k: v for k, v in cfg.items() if k not in ("envelopes", "envelope")}
+    flat.update(profiles.get(name, {}))
+    flat["envelope"] = name
+    return flat
 
 
 AIRBORNE_TOOLS = ("reposition", "goto_region", "orbit", "hover", "land")
@@ -93,6 +111,34 @@ class SafetyArbiter:
         if tool == "hover" and args["duration"] > L.max_hover_s:
             return False, f"duration exceeds the {L.max_hover_s:.0f} s maximum for one hover"
 
+        return True, ""
+
+    def check_plan(self, traj, state: VehicleState) -> tuple[bool, str]:
+        """A whole flight plan (trajectory.Trajectory), point by point. The
+        planner already keeps speed and acceleration inside the envelope; this
+        checks where the plan goes and for how long."""
+        L = self.limits
+        if not state.armed:
+            return False, "the drone is not airborne; call takeoff first"
+        if traj.duration > L.max_plan_s:
+            return False, (f"the plan takes {traj.duration:.0f} s; the maximum is "
+                           f"{L.max_plan_s:.0f} s, split it and append the rest later")
+        for k in traj.knots:
+            if k.dwell and k.dwell > L.max_hover_s:
+                return False, f"a hold of {k.dwell:g} s exceeds the {L.max_hover_s:.0f} s maximum"
+        for t, (e, n, a) in zip(traj.t, traj.pos):
+            r = math.hypot(e, n)
+            if r > L.geofence_radius_m:
+                return False, (f"at t+{t:.0f} s the plan is {r:.1f} m from launch "
+                               f"(east={e:.1f} north={n:.1f}), outside the "
+                               f"{L.geofence_radius_m:.0f} m geofence")
+            if a > L.max_altitude_m:
+                return False, (f"at t+{t:.0f} s the plan climbs to {a:.1f} m, above the "
+                               f"{L.max_altitude_m:.0f} m ceiling")
+            if a < L.min_altitude_m - 0.3 and t > 0:
+                return False, (f"at t+{t:.0f} s the plan is at {a:.1f} m, below the "
+                               f"{L.min_altitude_m:g} m floor; end the plan with land "
+                               f"to come down")
         return True, ""
 
     def _altitude(self, alt: float) -> str:

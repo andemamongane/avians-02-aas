@@ -199,6 +199,9 @@ def draw_ground_track(ax, f: FlightData, geofence_m: float | None) -> None:
         ax.plot(ce + r * np.cos(theta), cn + r * np.sin(theta), color=COMMANDED, lw=1.2,
                 linestyle=":", zorder=2, label="Commanded orbit" if n == 0 else None)
         ax.annotate(f"#{i}", (ce, cn), fontsize=12, color=INK_2, ha="center")
+    if f.meta.get("control") == "plan" and np.isfinite(f.sp_x).any():
+        ax.plot(f.sp_y, f.sp_x, color=COMMANDED, lw=1.4, ls="--", zorder=2,
+                label="Planned path")
     ax.plot(f.y, f.x, color=ACTUAL, label="Flown path", zorder=3, **_line_kw(f))
     ax.plot(0, 0, marker="s", color=INK, markersize=10, zorder=5, linestyle="none",
             label="Launch")
@@ -503,6 +506,8 @@ def headline(m: dict) -> str:
         f"{m['airborne_s']:g} s airborne",
         f"{m['tool_calls']} tool calls",
     ]
+    if m.get("flow"):
+        parts.append(f"hovering {m['flow']['hover_fraction'] * 100:.0f}% of the flight")
     if m["safety_rejections"]:
         n = len(m["safety_rejections"])
         parts.append(f"{n} unsafe command{'s' if n > 1 else ''} rejected")

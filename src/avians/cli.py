@@ -19,10 +19,10 @@ from .logging.trajectory import TrajectoryLogger
 from .maps import Map
 from .pilots import PilotConfigError, make_pilot, pilot_label
 from .runner import MissionRunner, RunCaps, build_system_prompt
-from .safety import Limits, SafetyArbiter
+from .safety import Limits, SafetyArbiter, resolve
 from .schema import SCHEMA_VERSION
 from .skills import Skills
-from .tools import ToolLayer
+from .tools import PlanToolLayer, ToolLayer
 
 REPO = Path(__file__).resolve().parents[2]
 CONFIG = REPO / "config"
@@ -85,7 +85,21 @@ def load_mission(path: str | Path) -> tuple[dict, str, Map | None]:
     from .monitor import POLICIES
     if mission.get("early_stop", "violated") not in POLICIES:
         raise SystemExit(f"{path}: early_stop must be one of {', '.join(POLICIES)}")
+    if mission.get("control", "plan") not in CONTROLS:
+        raise SystemExit(f"{path}: control must be one of {', '.join(CONTROLS)}")
+    try:
+        resolve(_load("limits.yaml"), mission.get("envelope"))
+    except ValueError as e:
+        raise SystemExit(f"{path}: {e}")
     return mission, prompt, m
+
+
+CONTROLS = ("plan", "step")      # plan-ahead (default) | step-by-step (the baseline)
+DRY_RUN_KEY = {"plan": "dry_run_plan", "step": "dry_run_script"}
+
+
+def _control(mission: dict, args: argparse.Namespace) -> str:
+    return getattr(args, "control", None) or mission.get("control", "plan")
 
 
 # ---------------------------------------------------------------- commands
@@ -94,10 +108,21 @@ def cmd_fly(args: argparse.Namespace) -> int:
 
     pilots_cfg = _load("pilots.yaml")
     pilot_name = args.pilot or pilots_cfg.get("default", "claude")
+    control = _control(mission, args)
+    if control == "plan" and args.backend == "aas":
+        # Before anything flies: plans need the avians trajectory controller in
+        # AAS's offboard framework, which is not written yet.
+        print("[avians] plan-ahead control is not available on AAS yet (the trajectory "
+              "controller is still to be built); use --control step, or --backend fake")
+        return 2
     if args.dry_run:
         from .testing_stub import StubPilot
-        script = [(s[0], s[1]) for s in mission.get("dry_run_script", [])] or None
-        pilot = StubPilot(script)
+        steps = mission.get(DRY_RUN_KEY[control])
+        if not steps:
+            print(f"[avians] {mission['name']} has no {DRY_RUN_KEY[control]} for "
+                  f"--control {control}")
+            return 2
+        pilot = StubPilot([(s[0], s[1]) for s in steps])
         pilot_name, model_id = "scripted", "scripted"
     else:
         # Before anything flies: a missing key or SDK must not strand a drone.
@@ -108,14 +133,16 @@ def cmd_fly(args: argparse.Namespace) -> int:
             return 2
         model_id = pilot.model
 
-    limits_cfg = _load("limits.yaml")
+    limits_cfg = resolve(_load("limits.yaml"), mission.get("envelope"))
+    limits = Limits.from_dict(limits_cfg)
     aas_cfg = _load("aas.yaml")
 
     backend, ros = _make_backend(args.backend, aas_cfg)
     episode = _next_episode_dir()
     if mission.get("map"):
         shutil.copy(REPO / mission["map"], episode / "map.yaml")
-    print(f"[avians] episode {episode.name}  backend={args.backend}  "
+    print(f"[avians] episode {episode.name}  backend={args.backend}  control={control}  "
+          f"envelope={limits_cfg['envelope']}  "
           f"pilot={pilot_name} ({pilot.provider}: {model_id})"
           + ("  (dry run: scripted, no API calls)" if args.dry_run else ""))
 
@@ -125,6 +152,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
     started = time.time()
     result = None
     monitor = None
+    executor = None
     try:
         backend.connect()
         recorder.start()
@@ -134,7 +162,17 @@ def cmd_fly(args: argparse.Namespace) -> int:
             default_timeout=limits_cfg.get("action_timeout_s", 60),
             land_timeout=limits_cfg.get("land_timeout_s", 120),
         )
-        tools = ToolLayer(skills, SafetyArbiter(Limits.from_dict(limits_cfg)), mission_map)
+        arbiter = SafetyArbiter(limits)
+        if control == "plan":
+            from .executor import PlanExecutor
+            from .trajectory import Envelope
+            executor = PlanExecutor(backend, arbiter, mission_map, Envelope.from_limits(limits),
+                                    land_timeout=limits_cfg.get("land_timeout_s", 120),
+                                    threaded=(args.backend != "fake"))
+            executor.start()
+            tools = PlanToolLayer(executor, mission_map)
+        else:
+            tools = ToolLayer(skills, arbiter, mission_map)
         monitor = _make_monitor(mission, mission_map, backend, limits_cfg, episode,
                                 threaded=(args.backend != "fake"))
 
@@ -146,7 +184,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 max_wall_s=mission.get("max_wall_s", 300),
                 max_tokens_total=mission.get("max_tokens_total", 300_000),
             ),
-            system_prompt=build_system_prompt(mission_map, spec_for_agent),
+            system_prompt=build_system_prompt(mission_map, spec_for_agent, control, limits),
             monitor=monitor,
         )
         result = runner.run(mission["name"], prompt, mission)
@@ -155,6 +193,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
         # The flight recorder keeps running a little after the last action so
         # the trace includes the drone settling (and landing, if it did).
         time.sleep(1.0 if args.backend != "fake" else 0.0)
+        if executor is not None:
+            executor.close()
         recorder.stop()
         logger.close()
         backend.disconnect()
@@ -170,6 +210,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
         "spec_shown_to_agent": bool(mission.get("spec") and mission.get("show_spec", True)),
         "map": mission.get("map"),
         "backend": args.backend,
+        "control": control,
+        "envelope": limits_cfg["envelope"],
         "dry_run": args.dry_run,
         "pilot": pilot_name,
         "pilot_label": "Scripted plan" if args.dry_run else pilot_label(pilot_name, pilots_cfg),
@@ -216,6 +258,7 @@ def _make_monitor(mission: dict, mission_map: Map | None, backend, limits_cfg: d
         policy=mission.get("early_stop", "violated"), future=future,
         eval_every_s=limits_cfg.get("monitor_eval_s", 1.0),
         log_path=episode / "stl_online.jsonl", threaded=threaded,
+        state_path=episode / "state.jsonl",
     )
 
 
@@ -289,7 +332,7 @@ def cmd_plot(args: argparse.Namespace) -> int:
     if not dirs:
         print(f"no episodes under {DATA}")
         return 1
-    geofence = _load("limits.yaml").get("geofence_radius_m")
+    geofence = resolve(_load("limits.yaml")).get("geofence_radius_m")
     formats = ("png", "pdf") if args.pdf else ("png",)
     ok = [_plot(d, geofence, dpi=args.dpi, formats=formats) for d in dirs]
     return 0 if all(ok) else 1
@@ -432,7 +475,10 @@ def cmd_check(args: argparse.Namespace) -> int:
     """Parse a mission's map and spec without flying; print what the agent sees."""
     mission, prompt, m = load_mission(args.mission)
     spec = mission.get("spec")
-    print(build_system_prompt(m, spec if mission.get("show_spec", True) else None))
+    control = _control(mission, args)
+    limits = Limits.from_dict(resolve(_load("limits.yaml"), mission.get("envelope")))
+    print(build_system_prompt(m, spec if mission.get("show_spec", True) else None,
+                              control, limits))
     print("\n--- mission prompt ---\n" + prompt)
     if spec:
         from .stl import parse
@@ -516,6 +562,8 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--pilot", help="AI agent from config/pilots.yaml "
                    "(claude, deepseek, codex, ...); default: its `default`")
     f.add_argument("--backend", default="aas", choices=["aas", "fake"])
+    f.add_argument("--control", choices=["plan", "step"],
+                   help="plan-ahead (missions default to it) or step-by-step (the baseline)")
     f.add_argument("--dry-run", action="store_true",
                    help="scripted client (the mission's dry_run_script), no API calls")
     f.add_argument("--no-plots", action="store_true",
@@ -524,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
 
     c = sub.add_parser("check", help="parse a mission's map and spec; print the agent's prompt")
     c.add_argument("mission")
+    c.add_argument("--control", choices=["plan", "step"])
     c.set_defaults(func=cmd_check)
 
     for name, helptext, func in (
