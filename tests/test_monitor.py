@@ -133,3 +133,35 @@ def test_threaded_monitor_samples_while_the_model_thinks(field_map):
     mon.close()
     assert len(mon.trace.t) >= 5 and mon.last is not None
     assert mon._thread is None
+
+
+def test_stopped_flight_is_plotted_with_its_landing(clock, tmp_path, monkeypatch):
+    """A4: plots, summary and video see the stop, and the monitor's landing
+    counts as landed even though the model never called land."""
+    pytest.importorskip("matplotlib")
+    import yaml
+    from avians import video
+    from avians.plots import plot_episode
+    from avians.plots.flight import load_episode
+
+    mission = yaml.safe_load((REPO / "missions" / "survey_then_land.yaml").read_text())
+    mission["dry_run_script"] = [[n, a] for n, a in THROUGH_NOFLY]
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / mission["prompt_file"]).write_text("fly")
+    path = tmp_path / "through.yaml"
+    path.write_text(yaml.safe_dump(mission))
+    monkeypatch.setattr(cli, "DATA", tmp_path / "episodes")
+    assert cli.main(["fly", str(path), "--backend", "fake", "--dry-run", "--no-plots"]) == 0
+    ep = tmp_path / "episodes" / "ep_0001"
+
+    f = load_episode(ep)
+    assert f.stop["verdict"] == "violated" and f.stop["landed"]
+    assert f.z[-1] == pytest.approx(0.0, abs=0.1) and f.t[-1] > f.stop["t"]   # landing traced
+    files, metrics = plot_episode(ep, 50.0, dpi=40)
+    assert ep / "plots" / "07_stl_online.png" in files
+    assert metrics["checks"]["landed"]
+    assert metrics["online"]["decided_at"][0]["verdict"] == "violated"
+    assert "## Online STL monitor" in (ep / "plots" / "summary.md").read_text()
+    live = video._live(f, [r["t"] for r in f.online], f.stop["t"])
+    assert live["verdict"] == "violated"
+    assert video._live(f, [r["t"] for r in f.online], -1.0) is None

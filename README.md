@@ -198,6 +198,11 @@ the live verdict. `meta.json` records the policy and the stop under
 `early_stop`. The monitor scores the agent-side state stream; the final
 `stl.json` is still computed offline from the rosbag.
 
+`plots/07_stl_online.png` shows the interval over time for the whole spec and
+each clause, when each clause was decided, the stop, and the final offline
+score (always inside the band). `summary.md` lists when each clause was known;
+`avians video` shows the live verdict per clause until the end of the flight.
+
 ## Known behaviour (read before debugging)
 
 | Symptom | Cause |

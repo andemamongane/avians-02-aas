@@ -72,6 +72,10 @@ class FlightData:
     # mission map (episode's map.yaml) and STL score (stl.json), when present
     map: Any = None
     stl: dict[str, Any] | None = None
+    # online STL monitor: one interval report per evaluation (stl_online.jsonl),
+    # and the early stop, if it ended the mission (see _monitor_stop)
+    online: list[dict[str, Any]] = field(default_factory=list)
+    stop: dict[str, Any] | None = None
 
     @property
     def dense(self) -> bool:
@@ -112,7 +116,40 @@ def load_episode(episode_dir: Path) -> FlightData:
         calls=calls, thinking=thinking, final_text=final_text,
         map=_load_map(d / "map.yaml"),
         stl=json.loads((d / "stl.json").read_text()) if (d / "stl.json").exists() else None,
+        online=load_jsonl(d / "stl_online.jsonl") if (d / "stl_online.jsonl").exists() else [],
+        stop=_monitor_stop(records, t0),
     )
+
+
+def _monitor_stop(records: list[dict], t0: float) -> dict | None:
+    """When the online monitor ended the mission: its time, verdict and reason,
+    and whether the landing that followed (not a model action) succeeded."""
+    ended = next((r for r in records if r["kind"] == "note"
+                  and r.get("message") == "stl monitor ended the mission"), None)
+    if ended is None:
+        return None
+    report = ended.get("report") or {}
+    landed = next((r for r in records if r["kind"] == "note"
+                   and r.get("message") == "monitor landed the drone"), None)
+    return {
+        "t": report.get("t", ended["t_wall"] - t0),
+        "verdict": report.get("verdict"),
+        "reason": ended.get("reason"),
+        "landed": bool(landed and landed.get("status") == "arrived"),
+    }
+
+
+def decided_at(online: list[dict]) -> list[dict]:
+    """Per clause, when the online monitor first knew the outcome (None: never)."""
+    if not online:
+        return []
+    out = []
+    for k, c in enumerate(online[-1]["clauses"]):
+        first = next((rep for rep in online if rep["clauses"][k]["verdict"] != "undecided"), None)
+        out.append({"clause": c["clause"],
+                    "verdict": first["clauses"][k]["verdict"] if first else "undecided",
+                    "t": first["t"] if first else None})
+    return out
 
 
 def _load_map(path: Path):
@@ -199,11 +236,14 @@ def _read_bag(bag_dir: Path, t0: float, origin=(0.0, 0.0, 0.0)):
 
 def _from_observations(records: list[dict], calls: list[ToolCall], t0: float):
     obs = [r for r in records if r["kind"] == "observation"]
-    rows = [(0.0, 0.0, 0.0, 0.0, 0.0)] + [
+    # notes with a state: the monitor's stop and landing, which no observation records
+    states = [(r, r["observation"]) for r in obs] + \
+             [(r, r["state"]) for r in records if r["kind"] == "note" and "state" in r]
+    rows = [(0.0, 0.0, 0.0, 0.0, 0.0)] + sorted(
         (r["t_wall"] - t0, o["north"], o["east"], o["alt"],
          math.sqrt(o["v_east"] ** 2 + o["v_north"] ** 2 + o["v_up"] ** 2))
-        for r in obs for o in [r["observation"]]
-    ]
+        for r, o in states
+    )
     p = np.array(rows, dtype=float)
 
     # commanded = the target of each flight action, held until the next one
@@ -235,7 +275,7 @@ def compute_metrics(f: FlightData) -> dict[str, Any]:
     air_t = f.t[airborne]
 
     land = next((c for c in reversed(f.calls) if c.tool == "land"), None)
-    landed = bool(land and land.status == "arrived")
+    landed = bool(land and land.status == "arrived") or bool(f.stop and f.stop["landed"])
     flight_calls = [c for c in f.calls if c.tool in FLIGHT_TOOLS]
     safety_rejections = [c for c in f.calls if c.status in ("rejected", "blocked")]
 
@@ -261,7 +301,8 @@ def compute_metrics(f: FlightData) -> dict[str, Any]:
 
     usage = f.meta.get("usage", {})
     checks = {
-        "ended by the model (not a cap)": f.meta.get("terminated_by") == "model_stop",
+        "ended by the model or the STL monitor (not a cap)": f.meta.get("terminated_by") in (
+            "model_stop", "stl_violated", "stl_satisfied"),
         "landed": landed,
         "no failed or timed-out actions": not any(
             c.status in ("failed", "timeout") for c in flight_calls),
@@ -291,6 +332,8 @@ def compute_metrics(f: FlightData) -> dict[str, Any]:
         "tokens": {"input": usage.get("input_tokens", 0),
                    "output": usage.get("output_tokens", 0)},
         "stl": f.stl,
+        "online": {"policy": (f.meta.get("early_stop") or {}).get("policy"),
+                   "stop": f.stop, "decided_at": decided_at(f.online)} if f.online else None,
         "checks": checks,
         "success": all(checks.values()),
     }

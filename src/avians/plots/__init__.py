@@ -59,6 +59,19 @@ def _summary_md(f, m: dict, headline: str) -> str:
             lines += ["", f"The flight ended at {stl['flight_end_s']} s; the last state was "
                           f"held for {stl['padded_s']} s to cover the spec's "
                           f"{stl['horizon_s']:g} s horizon."]
+    online = m.get("online")
+    if online:
+        stop = online["stop"]
+        lines += ["", "## Online STL monitor", "",
+                  f"Policy `{online['policy']}`. " + (
+                      f"It ended the mission at {stop['t']:.1f} s ({stop['verdict']}): "
+                      f"{stop['reason'].removeprefix('mission ended by the monitor: ')}. Landing afterwards: "
+                      f"{'succeeded' if stop['landed'] else 'did not complete'}."
+                      if stop else "It did not end the mission."), "",
+                  "| clause | known at | outcome |", "|---|---|---|"]
+        lines += [f"| `{d['clause']}` | "
+                  f"{'%.1f s' % d['t'] if d['t'] is not None else 'end of flight'} | "
+                  f"{d['verdict']} |" for d in online["decided_at"]]
     if m["holds"]:
         lines += ["", "## Position hold", ""]
         lines += [f"- {h['duration_s']} s hold: max drift {h['max_drift_m']} m, "

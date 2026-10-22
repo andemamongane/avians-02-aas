@@ -409,8 +409,9 @@ def _showcase_md(rows, missing, pilots_cfg) -> str:
     lines = ["# avians-02 showcase", "",
              "Each video replays one recorded flight (rosbag trace, the agent's tool calls, ",
              "its thinking time, the STL score). `compare.mp4` puts every pilot side by side.",
-             "", "| mission | pilot | STL | robustness | tool calls | tokens | video | episode |",
-             "|---|---|---|---|---|---|---|---|"]
+             "", "| mission | pilot | STL | robustness | ended by | tool calls | tokens | video "
+             "| episode |",
+             "|---|---|---|---|---|---|---|---|---|"]
     for name, p, ep in rows:
         meta = json.loads((ep / "meta.json").read_text())
         stl = json.loads((ep / "stl.json").read_text()) if (ep / "stl.json").exists() else {}
@@ -418,7 +419,8 @@ def _showcase_md(rows, missing, pilots_cfg) -> str:
         lines.append(
             f"| {name} | {pilot_label(p, pilots_cfg)} | "
             f"{'satisfied' if stl.get('satisfied') else ('violated' if stl else 'n/a')} | "
-            f"{stl.get('robustness', '')} | {meta.get('steps', '')} | "
+            f"{stl.get('robustness', '')} | {meta.get('terminated_by', '')} | "
+            f"{meta.get('steps', '')} | "
             f"{tok.get('input_tokens', 0) + tok.get('output_tokens', 0):,} | "
             f"[{p}.mp4]({name}/{p}.mp4) | {ep.name} |")
     if missing:

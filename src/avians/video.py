@@ -11,6 +11,7 @@ matplotlib + ffmpeg, both inside the container. 1920x1080, H.264.
 """
 from __future__ import annotations
 
+import bisect
 import math
 import textwrap
 from pathlib import Path
@@ -155,8 +156,22 @@ def _verdict(f: FlightData) -> tuple[str, str]:
     if not f.stl:
         return "no STL spec", MUTED
     ok = f.stl["satisfied"]
-    return (f"STL {'SATISFIED' if ok else 'VIOLATED'}   robustness {f.stl['robustness']}",
+    stop = f"   (monitor stop at {f.stop['t']:.0f} s)" if f.stop else ""
+    return (f"STL {'SATISFIED' if ok else 'VIOLATED'}   robustness {f.stl['robustness']}{stop}",
             PASS if ok else FAIL)
+
+
+LIVE = {"satisfied": ("+", PASS), "violated": ("-", FAIL), "undecided": ("?", INK_2)}
+
+
+def _bound(v) -> str:
+    return v if isinstance(v, str) else f"{v:.1f}"
+
+
+def _live(f: FlightData, times: list[float], t: float) -> dict | None:
+    """The online monitor's latest report at mission time t."""
+    k = bisect.bisect_right(times, t) - 1
+    return f.online[k] if k >= 0 else None
 
 
 def _frames(end: float, speed: float, fps: int, hold_s: float):
@@ -226,6 +241,7 @@ def render_episode(episode_dir: Path, out: Path, speed: float = 4.0, fps: int = 
     verdict = ax_stl.text(0.0, 0.05, "", fontsize=19, fontweight="bold",
                           transform=ax_stl.transAxes)
     vtext, vcol = _verdict(f)
+    live_t = [rep["t"] for rep in f.online]
 
     m = f.map
     writer = _writer(fps, f"{f.mission} {_label(f)}")
@@ -250,6 +266,17 @@ def render_episode(episode_dir: Path, out: Path, speed: float = 4.0, fps: int = 
             if m is not None:
                 e, n, a = r.at(t)
                 inside.set_text("inside: " + (", ".join(m.inside(e, n, a)) or "no region"))
+            rep = None if final else _live(f, live_t, t)
+            if rep is not None:
+                for c, txt in zip(rep["clauses"], clause_txt):
+                    sym, col = LIVE[c["verdict"]]
+                    txt.set_text(f"{sym} [{_bound(c['lo']):>7}, {_bound(c['hi']):>7}]  "
+                                 + textwrap.shorten(c["clause"], 48))
+                    txt.set_color(col)
+                stopped = f.stop and t >= f.stop["t"]
+                verdict.set_text(f"monitor stopped the mission at {f.stop['t']:.0f} s" if stopped
+                                 else f"live: {rep['verdict']}")
+                verdict.set_color(LIVE[f.stop["verdict"]][1] if stopped else MUTED)
             if final:
                 for c, txt in zip(clauses, clause_txt):
                     txt.set_text(f"{'+' if c['satisfied'] else '-'} {c['robustness']!s:>7}  "

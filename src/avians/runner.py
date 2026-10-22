@@ -117,15 +117,16 @@ class MissionRunner:
         """The monitor ended the mission: hold, then land. Not a model action, so
         it is logged as notes, never as tool calls."""
         self.monitor.disarm()
-        self.log.note("stl monitor ended the mission", reason=self.monitor.stop_reason,
-                      report=self.monitor.last)
         skills = self.tools.skills
-        if not skills.backend.get_state().armed:
+        st = skills.backend.get_state()
+        self.log.note("stl monitor ended the mission", reason=self.monitor.stop_reason,
+                      report=self.monitor.last, state=_state(st))
+        if not st.armed:
             return
         skills.abort()
         out = skills.land()
         self.log.note("monitor landed the drone", status=out.status, reason=out.reason,
-                      elapsed_s=round(out.elapsed, 1))
+                      elapsed_s=round(out.elapsed, 1), state=_state(out.state))
 
     def _loop(self, result: RunResult, mission_prompt: str) -> None:
         self.pilot.start(self.system_prompt, TOOL_SPECS, mission_prompt)
@@ -182,3 +183,10 @@ class MissionRunner:
 
             self.pilot.add_tool_results(native_results)
             messages.append({"role": "user", "content": tool_results})
+
+
+def _state(st) -> dict:
+    """Vehicle state for a note: the trace of actions the model did not take
+    (no observation records them; plots without a rosbag need them)."""
+    return {"east": st.east, "north": st.north, "alt": st.alt,
+            "v_east": st.v_east, "v_north": st.v_north, "v_up": st.v_up}

@@ -22,7 +22,7 @@ import numpy as np                        # noqa: E402
 from matplotlib.lines import Line2D       # noqa: E402
 from matplotlib.transforms import blended_transform_factory  # noqa: E402
 
-from .flight import FlightData, ToolCall  # noqa: E402
+from .flight import FlightData, ToolCall, decided_at  # noqa: E402
 
 # --- palette (validated reference palette, light mode) ---------------------
 SURFACE = "#ffffff"
@@ -132,6 +132,22 @@ def _mark_calls(ax, f: FlightData, label: bool = True) -> None:
                     fontsize=11, color=INK_2, ha="center", va="bottom", clip_on=False)
 
 
+def _mark_stop(ax, f: FlightData) -> None:
+    """A dashed line where the online STL monitor ended the mission."""
+    if not f.stop:
+        return
+    colour = STATUS["arrived"] if f.stop["verdict"] == "satisfied" else STATUS["failed"]
+    ax.axvline(f.stop["t"], color=colour, lw=1.6, ls="--", zorder=1)
+    trans = blended_transform_factory(ax.transData, ax.transAxes)
+    ax.text(f.stop["t"], 0.02, f" monitor stop ({f.stop['verdict']})", transform=trans,
+            fontsize=11, color=colour, ha="left", va="bottom")
+
+
+def _num(v) -> float:
+    """stl.json / stl_online.jsonl write infinities as strings."""
+    return np.inf if v == "inf" else -np.inf if v == "-inf" else float(v)
+
+
 def _commanded_targets(f: FlightData) -> list[tuple[int, ToolCall]]:
     return [(i, c) for i, c in enumerate(f.calls, 1)
             if c.tool in ("takeoff", "reposition", "goto_region") and c.target is not None
@@ -238,6 +254,7 @@ def draw_altitude(ax, f: FlightData) -> None:
     ax.plot(f.sp_t, f.sp_z, color=COMMANDED, lw=1.6, label="Commanded", drawstyle="steps-post")
     ax.plot(f.t, f.z, color=ACTUAL, label="Actual", **_line_kw(f))
     _mark_calls(ax, f)
+    _mark_stop(ax, f)
     ax.set_xlabel("Mission time (s)")
     ax.set_ylabel("Altitude above launch (m)")
     ax.set_ylim(bottom=min(0.0, np.nanmin(f.z)))
@@ -262,6 +279,7 @@ def draw_timeline(ax, f: FlightData, reasons: bool = True) -> None:
                            and c.status not in ("arrived", "ok") else "")
         ax.text(c.t_start + width + 0.6, k, note, va="center", fontsize=11, color=INK_2)
 
+    _mark_stop(ax, f)
     ax.set_yticks(range(n + 1), ["model thinking"] + rows)
     ax.set_ylim(n + 0.7, -0.7)
     ax.grid(axis="y", visible=False)
@@ -418,6 +436,65 @@ def fig_timeline(f: FlightData):
     return fig
 
 
+def fig_stl_online(f: FlightData):
+    """The robust satisfaction interval over the flight: overall, then per
+    clause. The band is every robustness the flight could still end with; the
+    diamond is the final (offline) score, which must lie inside every band."""
+    if not f.online:
+        return None
+    clauses = f.online[-1]["clauses"]
+    rows = [("whole specification", None)] + [(c["clause"], k) for k, c in enumerate(clauses)]
+    rows = rows[:5] if len(clauses) > 1 else rows[:1]
+    t = np.array([rep["t"] for rep in f.online])
+
+    def series(k):
+        reps = [rep if k is None else rep["clauses"][k] for rep in f.online]
+        return (np.array([_num(r["lo"]) for r in reps]), np.array([_num(r["hi"]) for r in reps]))
+
+    finite = [abs(v) for k in [None] + list(range(len(clauses))) for arr in series(k)
+              for v in arr if np.isfinite(v)]
+    clip = max(finite + [1.0]) * 1.15                 # infinite bounds run off the panel
+    final = ([_num(f.stl["robustness"])] + [_num(c["robustness"]) for c in f.stl["clauses"]]
+             if f.stl else None)
+    when = decided_at(f.online)
+
+    fig, axes = plt.subplots(len(rows), 1, figsize=FIGSIZE, layout="constrained",
+                             sharex=True, squeeze=False)
+    for ax, (label, k) in zip(axes[:, 0], rows):
+        lo, hi = series(k)
+        lo_c, hi_c = np.clip(lo, -clip, clip), np.clip(hi, -clip, clip)
+        ax.fill_between(t, lo_c, hi_c, step="post", color=ACTUAL, alpha=0.22, lw=0)
+        ax.step(t, lo_c, where="post", color=ACTUAL, lw=1.4)
+        ax.step(t, hi_c, where="post", color=ACTUAL, lw=1.4)
+        ax.axhline(0, color=INK_2, lw=1.0)
+        # symlog: bounds run to thousands (top speed x horizon), the verdict is
+        # decided near zero; linear within 1 m, logarithmic beyond
+        ax.set_yscale("symlog", linthresh=1.0)
+        ax.set_ylim(-clip, clip)
+        if final is not None:
+            r = final[0 if k is None else k + 1]
+            ax.plot([t[-1]], [np.clip(r, -clip, clip)], marker="D", color=INK, ms=8,
+                    clip_on=False, zorder=3)
+        if k is not None and when[k]["t"] is not None:
+            colour = STATUS["arrived"] if when[k]["verdict"] == "satisfied" else STATUS["failed"]
+            ax.axvline(when[k]["t"], color=colour, lw=1.2, ls=":")
+        _mark_stop(ax, f)
+        ax.set_title(textwrap.shorten(label, 90), fontsize=13, pad=6,
+                     family="monospace" if k is not None else None)
+        ax.tick_params(axis="y", labelsize=11)
+    axes[-1, 0].set_xlabel("Mission time (s)")
+    axes[-1, 0].set_xlim(0, max(t[-1], 1.0))
+    fig.supylabel("Robustness (symlog)", color=INK_2, fontsize=14)
+    handles = [Line2D([], [], color=ACTUAL, lw=8, alpha=0.4, label="Still possible"),
+               Line2D([], [], color=INK, marker="D", lw=0, label="Final (offline)"),
+               Line2D([], [], color=MUTED, ls=":", label="Decided")]
+    fig.legend(handles=handles, loc="outside upper right", ncols=3, fontsize=12)
+    fig.suptitle("Online STL score", x=0.012, ha="left", fontsize=20, fontweight="bold")
+    fig.get_layout_engine().set(rect=(0, 0.04, 1, 0.96))
+    _caption(fig, f)
+    return fig
+
+
 def headline(m: dict) -> str:
     parts = [
         f"{m['distance_flown_m']:g} m flown",
@@ -434,6 +511,9 @@ def headline(m: dict) -> str:
         stl = m["stl"]
         parts.append(f"STL {'satisfied' if stl['satisfied'] else 'violated'} "
                      f"(robustness {stl['robustness']})")
+    stop = (m.get("online") or {}).get("stop")
+    if stop:
+        parts.append(f"monitor stop at {stop['t']:.0f} s")
     return "  ·  ".join(parts)
 
 
@@ -444,6 +524,7 @@ FIGURES = {
     "04_position_tracking": lambda f, m, g: fig_position_tracking(f),
     "05_speed_battery": lambda f, m, g: fig_speed_battery(f),
     "06_agent_timeline": lambda f, m, g: fig_timeline(f),
+    "07_stl_online": lambda f, m, g: fig_stl_online(f),       # None without a monitor
 }
 
 
@@ -453,6 +534,8 @@ def save_all(f: FlightData, metrics: dict, out_dir: Path, geofence_m: float | No
     written = []
     for name, build in FIGURES.items():
         fig = build(f, metrics, geofence_m)
+        if fig is None:
+            continue
         for ext in formats:
             path = out_dir / f"{name}.{ext}"
             fig.savefig(path, dpi=dpi)
