@@ -6,6 +6,8 @@ the training data, so nothing may sit between the model and the log.
 Three independent caps end an episode cleanly, each catching a different
 failure: step cap (model loops), wall-clock cap (something hangs), token cap
 (runaway cost). Whichever trips is recorded in meta.json as terminated_by.
+The online STL monitor (monitor.py) can also end it once the outcome is
+decided (stl_violated / stl_satisfied); the runner then holds and lands.
 """
 from __future__ import annotations
 
@@ -77,25 +79,63 @@ class MissionRunner:
     canonical format whichever provider flew, so episodes are comparable."""
 
     def __init__(self, pilot, tools: ToolLayer, logger, model: str,
-                 caps: RunCaps | None = None, system_prompt: str | None = None):
+                 caps: RunCaps | None = None, system_prompt: str | None = None,
+                 monitor=None):
         self.pilot = pilot
         self.tools = tools
         self.log = logger
         self.model = model
         self.caps = caps or RunCaps()
         self.system_prompt = system_prompt or build_system_prompt(None, None)
+        self.monitor = monitor
 
     # ------------------------------------------------------------------
     def run(self, mission_name: str, mission_prompt: str, mission_cfg: dict) -> RunResult:
         result = RunResult()
         self.log.system(self.system_prompt, TOOL_SPECS)
         self.log.mission(mission_name, mission_prompt, mission_cfg)
+        if self.monitor is not None:
+            self.monitor.start()
+            self.tools.skills.interrupt = self.monitor.poll
+        try:
+            self._loop(result, mission_prompt)
+        finally:
+            if self.monitor is not None:
+                self.tools.skills.interrupt = None
+                if self.monitor.terminated_by:
+                    self._land_after_stop()
+                self.monitor.close()
+        return result
+
+    def _stopped(self, result: RunResult) -> bool:
+        if self.monitor is None or self.monitor.poll() is None:
+            return False
+        result.terminated_by = self.monitor.terminated_by
+        return True
+
+    def _land_after_stop(self) -> None:
+        """The monitor ended the mission: hold, then land. Not a model action, so
+        it is logged as notes, never as tool calls."""
+        self.monitor.disarm()
+        self.log.note("stl monitor ended the mission", reason=self.monitor.stop_reason,
+                      report=self.monitor.last)
+        skills = self.tools.skills
+        if not skills.backend.get_state().armed:
+            return
+        skills.abort()
+        out = skills.land()
+        self.log.note("monitor landed the drone", status=out.status, reason=out.reason,
+                      elapsed_s=round(out.elapsed, 1))
+
+    def _loop(self, result: RunResult, mission_prompt: str) -> None:
         self.pilot.start(self.system_prompt, TOOL_SPECS, mission_prompt)
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": mission_prompt}]
         t0 = time.time()
 
         while True:
+            if self._stopped(result):
+                break
             if result.steps >= self.caps.max_steps:
                 result.terminated_by = "step_cap"
                 break
@@ -142,5 +182,3 @@ class MissionRunner:
 
             self.pilot.add_tool_results(native_results)
             messages.append({"role": "user", "content": tool_results})
-
-        return result

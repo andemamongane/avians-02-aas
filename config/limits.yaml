@@ -13,3 +13,8 @@ max_orbit_s: 120.0
 arrive_radius_m: 1.0       # PX4 reposition settles within ~0.5 m in calm air; wind needs slack
 action_timeout_s: 60
 land_timeout_s: 120        # land flies home first, then descends
+
+# online STL monitor (missions choose early_stop: off | violated | decided)
+monitor_speed_margin: 1.5  # the monitor assumes the drone never exceeds max_speed_ms x this;
+                           # too tight and it can stop a flight that would have passed
+monitor_eval_s: 1.0        # seconds between robustness-interval updates

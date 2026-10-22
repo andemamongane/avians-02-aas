@@ -264,7 +264,10 @@ class Trace:
 
 
 # ---------------------------------------------------------------- semantics
-def _rho(node: Node, tr: Trace, m: Map | None, dt: float) -> list[float]:
+def _rho(node: Node, tr: Trace, m: Map | None, dt: float, need: int = 1) -> list[float]:
+    """Robustness per sample. Only the first `need` entries are guaranteed:
+    the top of a formula needs t = 0 alone, and each temporal operator widens
+    that by its window. This keeps U (quadratic) to O(window) at the top level."""
     n = len(tr.t)
     op = node.op
     if op == "true":
@@ -280,33 +283,40 @@ def _rho(node: Node, tr: Trace, m: Map | None, dt: float) -> list[float]:
             return [node.value - v for v in sig]
         return [v - node.value for v in sig]
     if op == "not":
-        return [-v for v in _rho(node.args[0], tr, m, dt)]
+        return [-v for v in _rho(node.args[0], tr, m, dt, need)]
     if op in ("and", "or"):
-        parts = [_rho(a, tr, m, dt) for a in node.args]
+        parts = [_rho(a, tr, m, dt, need) for a in node.args]
         f = min if op == "and" else max
         return [f(vals) for vals in zip(*parts)]
     lo, hi = int(round(node.lo / dt)), int(round(node.hi / dt))
+    sub = min(n, need + hi)
     if op in ("G", "F"):
-        return _window(_rho(node.args[0], tr, m, dt), lo, hi, use_min=(op == "G"))
+        return _window(_rho(node.args[0], tr, m, dt, sub), lo, hi, use_min=(op == "G"))
     if op == "U":
-        a, b = _rho(node.args[0], tr, m, dt), _rho(node.args[1], tr, m, dt)
-        out = []
-        for i in range(n):
-            best, run_min = -math.inf, math.inf
-            for j in range(i, min(n, i + hi + 1)):
-                if j >= i + lo:
-                    best = max(best, min(b[j], run_min))
-                run_min = min(run_min, a[j])
-            out.append(best)
-        return out
+        return _until(_rho(node.args[0], tr, m, dt, sub), _rho(node.args[1], tr, m, dt, sub),
+                      lo, hi, need)
     raise ValueError(f"unknown operator {op}")
+
+
+def _until(a: list[float], b: list[float], lo: int, hi: int, need: int) -> list[float]:
+    """The first `need` entries of p U[lo,hi] q (indices in samples)."""
+    n = min(len(a), len(b))
+    out = []
+    for i in range(min(n, need)):
+        best, run_min = -math.inf, math.inf
+        for j in range(i, min(n, i + hi + 1)):
+            if j >= i + lo:
+                best = max(best, min(b[j], run_min))
+            run_min = min(run_min, a[j])
+        out.append(best)
+    return out
 
 
 def _window(x: list[float], lo: int, hi: int, use_min: bool) -> list[float]:
     """out[i] = min (or max) of x[i+lo .. i+hi], clipped to the trace.
     Monotonic deque, O(n). Empty windows give +inf for G and -inf for F; the
     padding in score() makes them impossible for the spec's own horizon."""
-    n = len(x)
+    n = len(x)            # x may be shorter than the trace: only its needed prefix
     better = (lambda a, b: a <= b) if use_min else (lambda a, b: a >= b)
     empty = math.inf if use_min else -math.inf
     out, dq, nxt = [], deque(), 0
@@ -356,3 +366,126 @@ def score(spec_text: str, trace: Trace, m: Map | None = None, dt: float = 0.1) -
 def _round(v: float) -> float | str:
     """JSON has no infinity; an unconstrained clause (e.g. `true`) reports "inf"."""
     return ("inf" if v > 0 else "-inf") if math.isinf(v) else round(v, 3)
+
+
+# ---------------------------------------------------------------- online (ROSI)
+# Robust satisfaction intervals (Deshmukh et al. 2017): during a flight the
+# trace is known only up to now, so each formula's robustness is an interval
+# [lo, hi] that contains every value the finished flight could still score.
+# hi <= 0: the spec can no longer be satisfied, whatever the pilot does next.
+# lo > 0: it is satisfied already, whatever happens next.
+#
+# Every operator is monotone in its arguments (! is antitone), so intervals
+# propagate bound by bound through the same _window and _until as above.
+
+@dataclass
+class FutureBounds:
+    """What the unobserved rest of the flight can do. Without it the future is
+    (-inf, +inf) and a clause is decided only when its window has fully passed.
+
+    Region robustness is a signed distance and altitude margins are distances,
+    so every atom is 1-Lipschitz in position: a drone moving at most max_speed
+    cannot change an atom faster than max_speed per second. max_speed must be a
+    true bound on the vehicle (with margin over the commanded limit), or the
+    monitor can declare a violation that the flight would have avoided."""
+    max_speed: float = 12.0
+    alt_range: tuple[float, float] = (-1.0, 31.0)
+
+
+def _rho_iv(node: Node, tr: Trace, m: Map | None, dt: float, known: int,
+            future: FutureBounds | None, need: int = 1) -> tuple[list[float], list[float]]:
+    """(lo, hi) per sample. Samples [0, known) are observed; the rest are bounds.
+    tr holds the last observed state past `known` (from resampled())."""
+    n = len(tr.t)
+    op = node.op
+    if op == "true":
+        return [math.inf] * n, [math.inf] * n
+    if op in ("in", "cmp"):
+        head = Trace(tr.t[:known], tr.east[:known], tr.north[:known], tr.alt[:known],
+                     tr.speed[:known])
+        now = _rho(node, head, m, dt)
+        now += [now[-1]] * (n - known)       # past `known`: the value at t_now
+        lo, hi = list(now), list(now)
+        t_now = tr.t[known - 1]
+        for k in range(known, n):
+            if future is None:
+                lo[k], hi[k] = -math.inf, math.inf
+                continue
+            reach = future.max_speed * (tr.t[k] - t_now)
+            if op == "cmp" and node.signal == "speed":
+                s_lo, s_hi = 0.0, future.max_speed
+                lo[k], hi[k] = ((node.value - s_hi, node.value - s_lo) if node.cmp in ("<", "<=")
+                                else (s_lo - node.value, s_hi - node.value))
+            elif op == "cmp" and node.signal == "alt":
+                a0, (a_min, a_max) = tr.alt[k], future.alt_range
+                a_lo, a_hi = max(a_min, a0 - reach), min(a_max, a0 + reach)
+                lo[k], hi[k] = ((node.value - a_hi, node.value - a_lo) if node.cmp in ("<", "<=")
+                                else (a_lo - node.value, a_hi - node.value))
+            else:
+                lo[k], hi[k] = now[k] - reach, now[k] + reach
+        return lo, hi
+    if op == "not":
+        lo, hi = _rho_iv(node.args[0], tr, m, dt, known, future, need)
+        return [-v for v in hi], [-v for v in lo]
+    if op in ("and", "or"):
+        parts = [_rho_iv(a, tr, m, dt, known, future, need) for a in node.args]
+        f = min if op == "and" else max
+        return ([f(v) for v in zip(*(p[0] for p in parts))],
+                [f(v) for v in zip(*(p[1] for p in parts))])
+    w_lo, w_hi = int(round(node.lo / dt)), int(round(node.hi / dt))
+    sub = min(n, need + w_hi)
+    if op in ("G", "F"):
+        lo, hi = _rho_iv(node.args[0], tr, m, dt, known, future, sub)
+        g = op == "G"
+        return _window(lo, w_lo, w_hi, g), _window(hi, w_lo, w_hi, g)
+    if op == "U":
+        a_lo, a_hi = _rho_iv(node.args[0], tr, m, dt, known, future, sub)
+        b_lo, b_hi = _rho_iv(node.args[1], tr, m, dt, known, future, sub)
+        return _until(a_lo, b_lo, w_lo, w_hi, need), _until(a_hi, b_hi, w_lo, w_hi, need)
+    raise ValueError(f"unknown operator {op}")
+
+
+def verdict(lo: float, hi: float) -> str:
+    if lo > 0:
+        return "satisfied"
+    if hi <= 0:
+        return "violated"
+    return "undecided"
+
+
+def interval(spec: Node, trace: Trace, m: Map | None = None, dt: float = 0.1,
+             future: FutureBounds | None = None) -> tuple[float, float]:
+    """Robust satisfaction interval of the spec at t = 0, given the flight so far
+    (trace ends at "now")."""
+    tr, known = _online_grid(spec, trace, dt)
+    lo, hi = _rho_iv(spec, tr, m, dt, known, future)
+    return lo[0], hi[0]
+
+
+def _online_grid(spec: Node, trace: Trace, dt: float) -> tuple[Trace, int]:
+    t_now = trace.t[-1]
+    tr = trace.resampled(dt, max(t_now, spec.horizon()))
+    return tr, int(math.floor(t_now / dt + 1e-9)) + 1
+
+
+def score_online(spec_text: str | Node, trace: Trace, m: Map | None = None, dt: float = 0.1,
+                 future: FutureBounds | None = None) -> dict:
+    """Overall and per-clause intervals for the flight so far. Same clause split
+    as score(), so the two reports line up."""
+    spec = parse(spec_text) if isinstance(spec_text, str) else spec_text
+    tr, known = _online_grid(spec, trace, dt)
+    clauses = spec.args if spec.op == "and" else (spec,)
+
+    def entry(node: Node) -> dict:
+        lo, hi = _rho_iv(node, tr, m, dt, known, future)
+        return {"clause": str(node), "lo": _round(lo[0]), "hi": _round(hi[0]),
+                "verdict": verdict(lo[0], hi[0])}
+
+    lo, hi = _rho_iv(spec, tr, m, dt, known, future)
+    return {
+        "t": round(trace.t[-1], 2),
+        "lo": _round(lo[0]),
+        "hi": _round(hi[0]),
+        "verdict": verdict(lo[0], hi[0]),
+        "clauses": [entry(c) for c in clauses],
+    }

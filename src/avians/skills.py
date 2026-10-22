@@ -44,6 +44,9 @@ class Skills:
         self.default_timeout = default_timeout
         self.land_timeout = land_timeout
         self.settle_speed = settle_speed
+        # Called every poll while an action runs; a non-empty string stops the
+        # action (ABORTED, with that reason). The online STL monitor sets it.
+        self.interrupt = None
 
     # --- public actions -------------------------------------------------
     def takeoff(self, altitude: float, timeout: float | None = None) -> ActionOutcome:
@@ -106,6 +109,11 @@ class Skills:
 
             if not st.ok:
                 status, reason = FAILED, "no telemetry from the vehicle"
+                break
+
+            why = self.interrupt() if self.interrupt else None
+            if why:
+                status, reason = ABORTED, why
                 break
 
             if landing:

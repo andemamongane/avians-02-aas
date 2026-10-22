@@ -58,7 +58,7 @@ avians score 4                                    # re-score episode 4 against i
 avians plot --all                                 # figures for every episode
 avians video 4                                    # episode 4 as an MP4
 avians showcase --fly                             # every mission x pilot, filmed
-pytest                                            # 56 offline tests
+pytest                                            # 83 offline tests
 ```
 
 Keep the laptop awake during a flight. If the host sleeps, the simulator
@@ -108,6 +108,7 @@ spec: >-
   & F[0,120] G[0,10] in(survey_a)
   & F[0,240] (in(home_pad) & alt <= 1)
 show_spec: true          # false = the agent gets only the prompt
+early_stop: violated     # off | violated (default) | decided; see "Online scoring"
 dry_run_script: [...]    # flown by --dry-run instead of the model
 ```
 
@@ -169,10 +170,33 @@ data/episodes/ep_0004/
 ├── bag/               # rosbag2: PX4 position, status, commands (the trace STL is scored on)
 ├── map.yaml           # copy of the mission map
 ├── stl.json           # robustness overall and per clause
+├── stl_online.jsonl   # robustness interval per second during the flight (online monitor)
 ├── meta.json          # spec, model, PX4 / px4_msgs / AAS commit, frame origin, usage
 ├── adp.json           # ADP-style action/observation trajectory
 └── plots/             # ground track with regions, altitude, timeline, summary.md
 ```
+
+## Online scoring and early stop
+
+While the drone flies, a monitor scores the flight so far as a *robust
+satisfaction interval* `[lo, hi]`: the range the final robustness can still
+end up in, whatever the pilot does next (`src/avians/monitor.py`,
+`stl.score_online`). The future is bounded by physics: the drone cannot move
+faster than `max_speed_ms x monitor_speed_margin` (`config/limits.yaml`), so
+"reach field A within 3 s" from 40 m away is lost at once, not after 3 s.
+
+| `early_stop` | The mission ends when | `terminated_by` |
+|---|---|---|
+| `off` | never (intervals are still logged) | |
+| `violated` (default) | `hi <= 0`: the spec can no longer be satisfied | `stl_violated` |
+| `decided` | also `lo > 0`: satisfied whatever happens next | `stl_satisfied` |
+
+When it ends a mission, the action in progress returns `aborted` with the
+reason, the model gets no further turn, and avians holds and lands the drone.
+That landing is logged as notes, never as tool calls. The pilot never sees
+the live verdict. `meta.json` records the policy and the stop under
+`early_stop`. The monitor scores the agent-side state stream; the final
+`stl.json` is still computed offline from the rosbag.
 
 ## Known behaviour (read before debugging)
 

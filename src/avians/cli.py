@@ -82,6 +82,9 @@ def load_mission(path: str | Path) -> tuple[dict, str, Map | None]:
         unknown = check_regions(parse(mission["spec"]), m)
         if unknown:
             raise SystemExit(f"{path}: spec uses regions the map does not define: {unknown}")
+    from .monitor import POLICIES
+    if mission.get("early_stop", "violated") not in POLICIES:
+        raise SystemExit(f"{path}: early_stop must be one of {', '.join(POLICIES)}")
     return mission, prompt, m
 
 
@@ -121,6 +124,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                            enabled=(args.backend != "fake"))
     started = time.time()
     result = None
+    monitor = None
     try:
         backend.connect()
         recorder.start()
@@ -131,6 +135,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
             land_timeout=limits_cfg.get("land_timeout_s", 120),
         )
         tools = ToolLayer(skills, SafetyArbiter(Limits.from_dict(limits_cfg)), mission_map)
+        monitor = _make_monitor(mission, mission_map, backend, limits_cfg, episode,
+                                threaded=(args.backend != "fake"))
 
         spec_for_agent = mission.get("spec") if mission.get("show_spec", True) else None
         runner = MissionRunner(
@@ -141,6 +147,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 max_tokens_total=mission.get("max_tokens_total", 300_000),
             ),
             system_prompt=build_system_prompt(mission_map, spec_for_agent),
+            monitor=monitor,
         )
         result = runner.run(mission["name"], prompt, mission)
         print(f"[avians] {result.steps} steps, ended by {result.terminated_by}")
@@ -171,6 +178,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
         "duration_s": round(time.time() - started, 1),
         "steps": getattr(result, "steps", 0),
         "terminated_by": getattr(result, "terminated_by", "crashed"),
+        "early_stop": monitor.summary() if monitor else None,
         "usage": getattr(result, "usage", {}),
         "error": getattr(result, "error", None),
         "versions": _versions(),
@@ -188,6 +196,27 @@ def cmd_fly(args: argparse.Namespace) -> int:
     if not args.no_plots:
         _plot(episode, limits_cfg.get("geofence_radius_m"))
     return 0
+
+
+def _make_monitor(mission: dict, mission_map: Map | None, backend, limits_cfg: dict,
+                  episode: Path, threaded: bool):
+    """The online STL monitor for a mission with a spec (early_stop: off still
+    logs the intervals to stl_online.jsonl)."""
+    if not mission.get("spec"):
+        return None
+    from .monitor import OnlineMonitor
+    from .stl import FutureBounds
+    limits = Limits.from_dict(limits_cfg)
+    future = FutureBounds(
+        max_speed=limits.max_speed_ms * limits_cfg.get("monitor_speed_margin", 1.5),
+        alt_range=(-1.0, limits.max_altitude_m + 1.0),   # landed drift; ceiling overshoot
+    )
+    return OnlineMonitor(
+        mission["spec"], mission_map, backend,
+        policy=mission.get("early_stop", "violated"), future=future,
+        eval_every_s=limits_cfg.get("monitor_eval_s", 1.0),
+        log_path=episode / "stl_online.jsonl", threaded=threaded,
+    )
 
 
 def _score(episode: Path) -> dict | None:
