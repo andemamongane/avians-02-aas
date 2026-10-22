@@ -47,6 +47,14 @@ against this formula; times are seconds from the start of the mission.
 Requirements:
   {spec}"""
 
+SFO_GUIDE = """The requirements also use first-order quantifiers (signal first-order logic):
+  forall r : kind. p        p holds for every map region of that kind (exists: for some)
+  forall r in {a, b}. p     ... for each listed region
+  forall t in [a, b]. p     p holds for every moment t in [a, b] seconds (exists: some)
+  p @ t                     the formula p holds at moment t
+  alt@t2 >= alt@t1 - 3      signals compared between moments (alt speed east north);
+  t2 - t1 <= 30             moments compared directly"""
+
 
 PLAN_PROMPT = """You are piloting a quadrotor drone by planning its flight. You command it with
 flight plans, not single moves.
@@ -80,7 +88,7 @@ How control works:
 
 
 def build_system_prompt(mission_map: Map | None, spec: str | None, control: str = "step",
-                        limits=None) -> str:
+                        limits=None, logic: str = "stl") -> str:
     if control == "plan":
         from .safety import Limits
         L = limits or Limits()
@@ -94,6 +102,8 @@ def build_system_prompt(mission_map: Map | None, spec: str | None, control: str 
                      + mission_map.describe())
     if spec:
         parts.append(SPEC_GUIDE.format(spec=spec))
+        if logic == "sfo":
+            parts.append(SFO_GUIDE)
     if control != "plan":
         parts.append("Be efficient: every extra call costs time and battery.")
     return "\n\n".join(parts)

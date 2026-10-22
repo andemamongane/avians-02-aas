@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 
 from .maps import Map
-from .stl import FutureBounds, Trace, parse, score_online
+from .stl import FutureBounds, Trace, logic_module
 
 POLICIES = ("off", "violated", "decided")
 
@@ -40,10 +40,11 @@ class OnlineMonitor:
                  policy: str = "violated", future: FutureBounds | None = None,
                  eval_every_s: float = 1.0, dt: float = 0.1,
                  log_path: Path | None = None, threaded: bool = False, hz: float = 10.0,
-                 state_path: Path | None = None):
+                 state_path: Path | None = None, logic: str = "stl"):
         if policy not in POLICIES:
             raise ValueError(f"early_stop must be one of {', '.join(POLICIES)}, not '{policy}'")
-        self.spec = parse(spec)
+        self.logic = logic_module(logic)
+        self.spec = self.logic.parse(spec)
         self.map = mission_map
         self.backend = backend
         self.policy = policy
@@ -58,6 +59,7 @@ class OnlineMonitor:
         self.terminated_by: str | None = None
         self._t0: float | None = None
         self._last_eval = -float("inf")
+        self._eval_cost = 0.0                     # wall seconds the last evaluation took
         self._lock = threading.Lock()
         self._log = log_path.open("a", encoding="utf-8") if log_path else None
         # every sample, for plots and scoring when there is no rosbag (fake backend)
@@ -118,12 +120,16 @@ class OnlineMonitor:
                 self._state.write(json.dumps({
                     "t": round(t, 3), "east": round(st.east, 3), "north": round(st.north, 3),
                     "alt": round(st.alt, 3), "speed": round(st.speed, 3)}) + "\n")
-            if t - self._last_eval >= self.eval_every_s:
+            # heavy specs (SFO with time variables) are re-scored less often:
+            # never spend more than a fifth of the time scoring
+            if t - self._last_eval >= max(self.eval_every_s, 5 * self._eval_cost):
                 self._last_eval = t
                 self._evaluate()
 
     def _evaluate(self) -> None:
-        rep = score_online(self.spec, self.trace, self.map, self.dt, self.future)
+        t0 = time.perf_counter()
+        rep = self.logic.score_online(self.spec, self.trace, self.map, self.dt, self.future)
+        self._eval_cost = time.perf_counter() - t0
         self.last = rep
         if self._log is not None:
             self._log.write(json.dumps(rep) + "\n")

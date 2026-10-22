@@ -169,7 +169,7 @@ def _fly_dry_run(tmp_path, monkeypatch, mission: str, control: str = "plan") -> 
 
 @pytest.mark.parametrize("mission,control", [
     (m, c) for m in ("hover.yaml", "survey_then_land.yaml", "two_fields.yaml")
-    for c in ("plan", "step")] + [("slalom.yaml", "plan")])
+    for c in ("plan", "step")] + [("slalom.yaml", "plan"), ("field_patrol.yaml", "plan")])
 def test_dry_run_missions_satisfy_their_specs(clock, tmp_path, monkeypatch, mission, control):
     """Each mission's dry-run (dry_run_plan, dry_run_script) is a correct
     plan: flown on the fake backend it must satisfy the mission's STL spec."""

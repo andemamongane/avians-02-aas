@@ -78,9 +78,12 @@ def load_mission(path: str | Path) -> tuple[dict, str, Map | None]:
     prompt = (path.parent / "prompts" / mission["prompt_file"]).read_text().strip()
     m = Map.load(REPO / mission["map"]) if mission.get("map") else None
     if mission.get("spec"):
-        from .stl import check_regions, parse
-        parse(mission["spec"])                       # fail before flying, not after
-        unknown = check_regions(parse(mission["spec"]), m)
+        from .stl import LOGICS, logic_module
+        if mission.get("logic", "stl") not in LOGICS:
+            raise SystemExit(f"{path}: logic must be one of {', '.join(LOGICS)}")
+        logic = logic_module(mission.get("logic", "stl"))
+        logic.parse(mission["spec"])                 # fail before flying, not after
+        unknown = logic.check_regions(logic.parse(mission["spec"]), m)
         if unknown:
             raise SystemExit(f"{path}: spec uses regions the map does not define: {unknown}")
     from .monitor import POLICIES
@@ -203,7 +206,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 max_wall_s=mission.get("max_wall_s", 300),
                 max_tokens_total=mission.get("max_tokens_total", 300_000),
             ),
-            system_prompt=build_system_prompt(mission_map, spec_for_agent, control, limits),
+            system_prompt=build_system_prompt(mission_map, spec_for_agent, control, limits,
+                                              logic=mission.get("logic", "stl")),
             monitor=monitor,
         )
         if sim is not None:
@@ -233,6 +237,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
         "created": datetime.now().isoformat(timespec="seconds"),
         "mission": mission["name"],
         "spec": mission.get("spec"),
+        "logic": mission.get("logic", "stl"),
         "spec_shown_to_agent": bool(mission.get("spec") and mission.get("show_spec", True)),
         "map": mission.get("map"),
         "backend": args.backend,
@@ -286,6 +291,7 @@ def _make_monitor(mission: dict, mission_map: Map | None, backend, limits_cfg: d
         policy=mission.get("early_stop", "violated"), future=future,
         eval_every_s=limits_cfg.get("monitor_eval_s", 1.0),
         log_path=episode / "stl_online.jsonl", threaded=threaded,
+        logic=mission.get("logic", "stl"),
         state_path=episode / "state.jsonl",
     )
 
@@ -295,7 +301,7 @@ def _score(episode: Path) -> dict | None:
     safely on disk, and a scoring problem must not look like a failed flight."""
     try:
         from .plots.flight import load_episode
-        from .stl import Trace, score
+        from .stl import Trace, logic_module
         meta = json.loads((episode / "meta.json").read_text())
         if not meta.get("spec"):
             return None
@@ -304,7 +310,7 @@ def _score(episode: Path) -> dict | None:
         trace = Trace(t=[max(0.0, float(v)) for v in f.t], east=list(map(float, f.y)),
                       north=list(map(float, f.x)), alt=list(map(float, f.z)),
                       speed=list(map(float, f.speed)))
-        report = score(meta["spec"], trace, m)
+        report = logic_module(meta.get("logic", "stl")).score(meta["spec"], trace, m)
         report["trace_source"] = f.source
         (episode / "stl.json").write_text(json.dumps(report, indent=2))
     except Exception as e:
@@ -312,7 +318,7 @@ def _score(episode: Path) -> dict | None:
               f"retry with: avians score {episode.name}")
         return None
     verdict = "SATISFIED" if report["satisfied"] else "VIOLATED"
-    print(f"[avians] STL {verdict}  robustness {report['robustness']}  ({report['trace_source']})")
+    print(f"[avians] {report.get('logic', 'stl').upper()} {verdict}  robustness {report['robustness']}  ({report['trace_source']})")
     for c in report["clauses"]:
         print(f"           {'+' if c['satisfied'] else '-'} {c['robustness']:>8}  {c['clause']}")
     if report["padded_s"]:
@@ -535,13 +541,15 @@ def cmd_check(args: argparse.Namespace) -> int:
     spec = mission.get("spec")
     control = _control(mission, args)
     limits = Limits.from_dict(resolve(_load("limits.yaml"), mission.get("envelope")))
+    logic = mission.get("logic", "stl")
     print(build_system_prompt(m, spec if mission.get("show_spec", True) else None,
-                              control, limits))
+                              control, limits, logic=logic))
     print("\n--- mission prompt ---\n" + prompt)
     if spec:
-        from .stl import parse
-        node = parse(spec)
-        print(f"\n--- spec parsed as ---\n{node}\nhorizon {node.horizon():g} s")
+        from . import sfo
+        node = sfo.parse(spec)                       # SFO is a superset: shows either
+        print(f"\n--- {logic.upper()} spec parsed as ---\n{sfo.to_text(node)}\n"
+              f"horizon {sfo.horizon(node):g} s")
     return 0
 
 

@@ -489,3 +489,19 @@ def score_online(spec_text: str | Node, trace: Trace, m: Map | None = None, dt: 
         "verdict": verdict(lo[0], hi[0]),
         "clauses": [entry(c) for c in clauses],
     }
+
+
+# ---------------------------------------------------------------- logic choice
+LOGICS = ("stl", "sfo")
+
+
+def logic_module(logic: str = "stl"):
+    """The scorer for a mission's `logic:` (stl, or sfo: signal first-order
+    logic, a superset). Both expose parse, check_regions, score, score_online."""
+    if logic == "sfo":
+        from . import sfo
+        return sfo
+    if logic == "stl":
+        import sys
+        return sys.modules[__name__]
+    raise ValueError(f"logic must be one of {', '.join(LOGICS)}, not {logic!r}")

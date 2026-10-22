@@ -62,7 +62,7 @@ avians score 4                                    # re-score episode 4 against i
 avians plot --all                                 # figures for every episode
 avians video 4                                    # episode 4 as an MP4
 avians showcase --fly                             # every mission x pilot, filmed
-pytest                                            # 139 offline tests
+pytest                                            # 164 offline tests
 ```
 
 Keep the laptop awake during a flight. If the host sleeps, the simulator
@@ -110,6 +110,7 @@ map: maps/field_01.yaml
 spec: >-
   G[0,240] !in(nofly_1)
   & F[0,120] (G[0,10] in(survey_a) & F[0,120] (in(home_pad) & alt <= 1))
+logic: stl               # or sfo (signal first-order logic, below)
 show_spec: true          # false = the agent gets only the prompt
 early_stop: violated     # off | violated (default) | decided; see "Online scoring"
 dry_run_plan: [...]      # flown by --dry-run instead of the model (plan-ahead)
@@ -146,6 +147,29 @@ Whether the agent stays out of a no-fly zone is what the STL score measures.
 Times are seconds from mission start. Robustness > 0 means satisfied with that
 margin. Flights shorter than the spec's horizon are padded by holding the last
 state (the drone stays where it landed); the report says how much.
+
+### SFO: signal first-order logic (`logic: sfo`)
+
+A mission can write its spec in SFO instead (`src/avians/sfo.py`), a superset of
+STL: every STL spec is valid SFO with the same score. SFO adds quantifiers over
+map regions and over moments, and compares signals *between* moments:
+
+| Syntax | Meaning | Robustness |
+|---|---|---|
+| `forall r : no_fly. p` | p for every region of that kind (`exists`: some) | min (max) over the regions |
+| `forall r in {a, b}. p` | p for each listed region | min (max) |
+| `forall t in [0, 240]. p` | p for every moment t in the window (`exists`: some) | min (max) over the moments |
+| `exists t2 in [t1, t1 + 30]. p` | bounds: a number, or an outer variable ± a number | |
+| `(G[0,5] in(a)) @ t` | an STL formula holding at moment t | its robustness at t |
+| `alt@t2 >= alt@t1 - 3`, `t2 - t1 <= 30` | linear comparisons of `alt speed east north` at moments, and of moments | the margin |
+
+At most two nested time variables. G, F and U take STL only: quantify outside
+them and use `@`. A quantifier's body extends as far right as it can, so
+parenthesize it to make it one clause. `missions/field_patrol.yaml` uses all of
+it ("survey every field, in any order, and land after each"; "once over field
+A, never drop more than 1 m below the entry altitude for 5 s"). SFO specs get
+the same online intervals and early stop as STL ones; heavy specs are
+re-scored less often (the monitor spends at most a fifth of its time scoring).
 
 ## Tools the agent gets: plan-ahead and step-by-step
 

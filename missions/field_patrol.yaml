@@ -1,0 +1,26 @@
+# Signal first-order logic (logic: sfo): the clauses quantify over map regions
+# (every no-fly zone, every survey field) and over moments, and compare the
+# altitude at two moments, which STL cannot say.
+name: field_patrol
+prompt_file: field_patrol.txt
+map: maps/field_01.yaml
+logic: sfo
+spec: >-
+  (forall r : no_fly. G[0,240] !in(r))
+  & (forall r : goal. exists t1 in [0, 150].
+       ((G[0,5] in(r)) @ t1 & exists t2 in [t1, t1 + 90]. (in(home_pad) & alt <= 1) @ t2))
+  & (forall t1 in [0, 200]. (in(survey_a) @ t1 -> forall t2 in [t1, t1 + 5]. alt@t2 >= alt@t1 - 1))
+show_spec: true
+max_steps: 20
+max_wall_s: 300
+description: Survey every field in any order, keep height over field A, avoid no-fly zones, land.
+
+dry_run_plan:
+  - [takeoff, {altitude: 6}]
+  - [fly_plan, {segments: [{type: region, region: survey_b, altitude: 6},
+                           {type: hold, duration: 6},
+                           {type: region, region: survey_a, altitude: 6},
+                           {type: hold, duration: 6},
+                           {type: waypoint, east: 0, north: 20, altitude: 6},
+                           {type: land}]}]
+  - [wait, {seconds: 200, until: landed}]

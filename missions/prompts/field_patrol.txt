@@ -1,0 +1,5 @@
+Patrol the survey fields: survey every survey field on the map for at least 5
+continuous seconds, in any order, within the first two and a half minutes, then
+land on the pad. Keep out of every no-fly zone. Once you are over field A, hold
+your height: never drop more than 1 m below the altitude you entered it at, for
+the next 5 seconds.
