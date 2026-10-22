@@ -105,8 +105,7 @@ prompt_file: survey_then_land.txt
 map: maps/field_01.yaml
 spec: >-
   G[0,240] !in(nofly_1)
-  & F[0,120] G[0,10] in(survey_a)
-  & F[0,240] (in(home_pad) & alt <= 1)
+  & F[0,120] (G[0,10] in(survey_a) & F[0,120] (in(home_pad) & alt <= 1))
 show_spec: true          # false = the agent gets only the prompt
 early_stop: violated     # off | violated (default) | decided; see "Online scoring"
 dry_run_script: [...]    # flown by --dry-run instead of the model

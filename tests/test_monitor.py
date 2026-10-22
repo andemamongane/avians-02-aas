@@ -21,8 +21,8 @@ from avians.tools import ToolLayer
 
 from conftest import REPO
 
-SURVEY_SPEC = ("G[0,240] !in(nofly_1) & F[0,120] G[0,10] in(survey_a) "
-               "& F[0,240] (in(home_pad) & alt <= 1)")
+SURVEY_SPEC = ("G[0,240] !in(nofly_1) "
+               "& F[0,120] (G[0,10] in(survey_a) & F[0,120] (in(home_pad) & alt <= 1))")
 # Straight from the pad to field A: through the power lines.
 THROUGH_NOFLY = [("takeoff", {"altitude": 5}),
                  ("reposition", {"east": 15, "north": 25, "altitude": 5}),
@@ -88,7 +88,17 @@ def test_correct_plan_is_never_stopped(clock, tmp_path, field_map):
             ("reposition", {"east": 0, "north": 20, "altitude": 5}), ("land", {})]
     result, monitor, _, _ = fly(clock, tmp_path, field_map, SURVEY_SPEC, "violated", plan)
     assert result.terminated_by == "model_stop" and monitor.terminated_by is None
-    assert monitor.last["clauses"][1]["verdict"] == "satisfied"     # survey done
+    assert monitor.last["clauses"][0]["verdict"] == "undecided"     # G runs to 240 s
+    assert robustness(parse(SURVEY_SPEC), monitor.trace, field_map) > 0
+
+
+def test_survey_without_landing_fails(clock, tmp_path, field_map):
+    """Starting on the pad must not count as landing: the landing comes after
+    the survey (the old spec's F (in(home_pad) & alt <= 1) held at t = 0)."""
+    plan = [("takeoff", {"altitude": 5}), ("reposition", {"east": 0, "north": 16, "altitude": 5}),
+            ("goto_region", {"region": "survey_a", "altitude": 5}), ("hover", {"duration": 12})]
+    _, monitor, _, _ = fly(clock, tmp_path, field_map, SURVEY_SPEC, "off", plan)
+    assert robustness(parse(SURVEY_SPEC), monitor.trace, field_map) < 0
 
 
 def test_sampling_ignores_repeated_timestamps(clock, field_map):

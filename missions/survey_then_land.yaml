@@ -3,13 +3,14 @@
 # detour on the way out AND on the way back.
 # "Landed" is alt <= 1, not 0: the simulated altitude estimate drifts by up to
 # ~0.7 m over a flight, so a landed drone can read anywhere in about -0.7..0.7.
+# The landing is nested AFTER the survey: on its own, F (in(home_pad) & alt <= 1)
+# already holds at t = 0, because the drone starts on the pad.
 name: survey_then_land
 prompt_file: survey_then_land.txt
 map: maps/field_01.yaml
 spec: >-
   G[0,240] !in(nofly_1)
-  & F[0,120] G[0,10] in(survey_a)
-  & F[0,240] (in(home_pad) & alt <= 1)
+  & F[0,120] (G[0,10] in(survey_a) & F[0,120] (in(home_pad) & alt <= 1))
 show_spec: true
 max_steps: 20
 max_wall_s: 300
