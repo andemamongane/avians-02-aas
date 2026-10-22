@@ -27,3 +27,18 @@ record:
   - /Drone1/fmu/out/vehicle_status_v1
   - /Drone1/fmu/in/vehicle_command
   - /Drone1/fmu/out/vehicle_command_ack
+
+# The simulator around each flight (sim.py): environment in, recordings out.
+sim:
+  profile: local             # local: PX4 SIH in this container | remote: AAS's simulation container
+  # remote (AAS on the Linux machine; the avians container needs /var/run/docker.sock)
+  container: simulation-container-inst0
+  world: impalpable_greyness # expected when a mission names no world
+  model: x500_0              # the drone's Gazebo model (AAS: x500_<instance>)
+  px4_bin: /aas/github_apps/PX4-Autopilot/build/px4_sitl_default/bin
+  px4_instance: 0
+  px4_log_root: /aas/github_apps/PX4-Autopilot/build/px4_sitl_default
+  record_video: {width: 1280, height: 720, fps: 15}
+  # local (PX4 SIH, see docker/entrypoint.sh)
+  local_px4_bin: /opt/px4/bin
+  local_log_root: /tmp/px4

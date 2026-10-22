@@ -22,6 +22,8 @@ services:
       - ../tests:/workspace/tests
       - ../data:/workspace/data         # episodes land on the host
     working_dir: /workspace
+    extra_hosts:               # QGroundControl on the host (Linux needs this; Docker Desktop has it)
+      - "host.docker.internal:host-gateway"
     command: ["tail", "-f", "/dev/null"]
     stdin_open: true
     tty: true

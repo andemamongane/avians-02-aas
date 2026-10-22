@@ -45,6 +45,20 @@ if [ "$AVIANS_START_SIM" = "1" ]; then
 
   if wait_for "/${AVIANS_DRONE_NS}/fmu topics" 60 \
        bash -c "ros2 topic list | grep -q '^/${AVIANS_DRONE_NS}/fmu/out/'"; then
+    # QGroundControl on the host (display only): an extra MAVLink stream to
+    # host.docker.internal:14550, where QGC listens by default. PX4 wants an
+    # IP, not a name. AVIANS_QGC_HOST= (empty) turns it off.
+    QGC_HOST="${AVIANS_QGC_HOST-host.docker.internal}"
+    if [ -n "$QGC_HOST" ]; then
+      QGC_IP=$(getent ahostsv4 "$QGC_HOST" | awk 'NR==1 {print $1}')
+      if [ -n "$QGC_IP" ]; then
+        (cd /tmp/px4 && px4-mavlink start -x -u 14600 -r 4000000 -t "$QGC_IP" -o 14550) \
+          >>/tmp/px4.log 2>&1 \
+          && echo "[entrypoint] MAVLink to QGroundControl at ${QGC_HOST} (${QGC_IP}):14550"
+      else
+        echo "[entrypoint] ${QGC_HOST} does not resolve; no QGroundControl stream"
+      fi
+    fi
     echo "[entrypoint] starting AAS px4_interface"
     ros2 run autopilot_interface px4_interface --ros-args -r __ns:=/${AVIANS_DRONE_NS} \
       >/tmp/px4_interface.log 2>&1 &

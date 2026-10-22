@@ -1,0 +1,44 @@
+# A slalom course for the aggressive envelope (150 m geofence). Coordinates are
+# metres EAST and NORTH of the launch point. Three walls with alternating gaps
+# stand between the pad and the finish; they reach the 40 m ceiling, so the
+# only way through is round them. In Gazebo they are solid.
+name: course_01
+description: >-
+  Open ground with three walls between the pad and the finish box, 120 m north.
+  The gaps alternate east, west, east.
+regions:
+  - id: wall_1
+    name: First wall
+    kind: no_fly
+    description: Wall 30-34 m north of the pad, from 80 m west to 20 m east. The gap is east of it.
+    polygon: [[-80, 30], [20, 30], [20, 34], [-80, 34]]
+    altitude: [0, 40]
+    solid: true
+
+  - id: wall_2
+    name: Second wall
+    kind: no_fly
+    description: Wall 60-64 m north, from 20 m west to 80 m east. The gap is west of it.
+    polygon: [[-20, 60], [80, 60], [80, 64], [-20, 64]]
+    altitude: [0, 40]
+    solid: true
+
+  - id: wall_3
+    name: Third wall
+    kind: no_fly
+    description: Wall 90-94 m north, from 80 m west to 20 m east. The gap is east of it.
+    polygon: [[-80, 90], [20, 90], [20, 94], [-80, 94]]
+    altitude: [0, 40]
+    solid: true
+
+  - id: finish
+    name: Finish box
+    kind: goal
+    description: The finish, 115-130 m north of the pad, 15 m either side of it.
+    polygon: [[-15, 115], [15, 115], [15, 130], [-15, 130]]
+
+  - id: home_pad
+    name: Launch pad
+    kind: landing
+    description: The launch and landing pad.
+    polygon: [[-2, -2], [2, -2], [2, 2], [-2, 2]]

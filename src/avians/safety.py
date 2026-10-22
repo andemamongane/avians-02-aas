@@ -31,6 +31,9 @@ class Limits:
     max_descent_ms: float = 1.5
     corner_radius_m: float = 4.0
     max_plan_s: float = 600.0
+    # handed to PX4 only (environment.envelope_params); None leaves PX4's value
+    max_tilt_deg: float | None = None
+    max_jerk_ms3: float | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Limits":

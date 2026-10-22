@@ -1,0 +1,27 @@
+# Plan-ahead flight at speed: the deadline is reachable only by flying through
+# the gaps without stopping (about 245 m each way). Step-by-step flight, which
+# stops at every point, misses it.
+name: slalom
+prompt_file: slalom.txt
+map: maps/course_01.yaml
+envelope: aggressive
+spec: >-
+  G[0,150] (!in(wall_1) & !in(wall_2) & !in(wall_3) & alt <= 20)
+  & F[0,45] (G[0,2] in(finish) & F[0,60] (in(home_pad) & alt <= 1))
+show_spec: true
+max_steps: 20
+max_wall_s: 240
+description: Slalom 120 m north through three walls within 45 s, then back and land.
+
+dry_run_plan:
+  - [takeoff, {altitude: 8}]
+  - [fly_plan, {segments: [{type: waypoint, east: 40, north: 32, altitude: 8},
+                           {type: waypoint, east: -40, north: 62, altitude: 8},
+                           {type: waypoint, east: 40, north: 92, altitude: 8},
+                           {type: region, region: finish, altitude: 8},
+                           {type: hold, duration: 3},
+                           {type: waypoint, east: 40, north: 92, altitude: 8},
+                           {type: waypoint, east: -40, north: 62, altitude: 8},
+                           {type: waypoint, east: 40, north: 32, altitude: 8},
+                           {type: land}]}]
+  - [wait, {seconds: 150, until: landed}]

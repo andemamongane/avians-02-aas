@@ -7,10 +7,10 @@ in signal temporal logic (STL) over a map of polygon regions.
 
 | In scope | Out of scope (later) |
 |---|---|
-| AAS's `autopilot_interface` (takeoff, reposition, orbit, land) on PX4 v1.17.0 | Perception (YOLO, cameras, LiDAR) |
+| Plan-ahead flight through AAS on PX4 v1.17.0 (and the step-by-step baseline) | Perception (YOLO, cameras, LiDAR) |
 | Maps of named polygon regions; tools that use them | Multi-drone, VTOLs, ArduPilot |
-| STL specs, robustness scoring per clause | Gazebo worlds/wind on the laptop (remote machine only) |
-| One quadrotor, PX4 SIH locally | Fine-tuning, RL |
+| STL specs, robustness scoring per clause, online early stop | Gazebo on the laptop (remote machine only) |
+| One quadrotor; Gazebo worlds, wind, failures, recordings on the remote machine | Fine-tuning, RL |
 
 ## Two ways to run
 
@@ -18,13 +18,16 @@ in signal temporal logic (STL) over a map of polygon regions.
 |---|---|---|
 | PX4 | v1.17.0 + AAS's patch and DDS topic list | same |
 | Autopilot interface | AAS `px4_interface`, built from the pinned submodule | same |
-| Physics | PX4's built-in SIH (no world, no wind) | Gazebo Harmonic, wind, worlds |
-| QGroundControl | none | AAS ground container |
+| Physics | PX4's built-in SIH (no world, no wind) | Gazebo Harmonic: x500 dynamics, worlds, wind |
+| Mission `environment:` | PX4 parameters and failures only | everything (see "Environment") |
+| Recordings | PX4 `.ulg` | PX4 `.ulg`, Gazebo chase-camera video, Gazebo poses |
+| QGroundControl (display) | QGC on the host, fed by PX4 SIH | AAS ground container |
+| Start with | `./scripts/up.sh` | `./scripts/up_remote.sh` (after AAS) |
 | avians code | identical | identical |
 
 The local container runs the **real** AAS interface node against the same PX4
 version, so the tools behave exactly as they will on the remote machine. Only
-the physics differs. The remote setup is not wired up yet (see the end).
+the physics differs. The remote side is written but not yet run (see the end).
 
 ## Quick start (local)
 
@@ -59,7 +62,7 @@ avians score 4                                    # re-score episode 4 against i
 avians plot --all                                 # figures for every episode
 avians video 4                                    # episode 4 as an MP4
 avians showcase --fly                             # every mission x pilot, filmed
-pytest                                            # 125 offline tests
+pytest                                            # 139 offline tests
 ```
 
 Keep the laptop awake during a flight. If the host sleeps, the simulator
@@ -200,6 +203,10 @@ data/episodes/ep_0004/
 ├── stl.json           # robustness overall and per clause
 ├── stl_online.jsonl   # robustness interval per second during the flight (online monitor)
 ├── state.jsonl        # the vehicle state as the monitor sampled it (the trace when there is no bag)
+├── wind.json          # the wind schedule played (t, east, north)
+├── px4.ulg            # PX4's own flight log
+├── gazebo.mp4         # chase-camera video (remote machine)
+├── gazebo_poses.jsonl # every Gazebo model's pose during the flight (remote machine)
 ├── meta.json          # spec, model, PX4 / px4_msgs / AAS commit, frame origin, usage
 ├── adp.json           # ADP-style action/observation trajectory
 └── plots/             # ground track with regions, altitude, timeline, summary.md
@@ -232,6 +239,47 @@ each clause, when each clause was decided, the stop, and the final offline
 score (always inside the band). `summary.md` lists when each clause was known;
 `avians video` shows the live verdict per clause until the end of the flight.
 
+## Environment: making the simulation realistic
+
+A mission can declare the conditions it flies in. `src/avians/sim.py` applies
+them before takeoff and records the flight; `meta.json` keeps what was applied.
+
+```yaml
+environment:
+  world: impalpable_greyness   # checked against the running Gazebo (set at AAS start: WORLD=...)
+  wind:
+    east: 3.0                  # mean wind, m/s, blowing TOWARD east (from the west)
+    north: 0.0
+    gust_std: 1.5              # gusts per axis, m/s (Gauss-Markov, reproducible from seed)
+    gust_tau: 4.0              # gust correlation time, s
+    seed: 7
+  failures:                    # PX4 failure injection
+    - {at: 30, unit: gps, type: off, duration: 8}
+  battery: {drain_s: 600, min_pct: 15}
+  px4_params: {COM_DISARM_LAND: 1.0}
+```
+
+The flight envelope becomes PX4's own limits too (`MPC_XY_VEL_MAX`,
+`MPC_ACC_HOR_MAX`, `MPC_TILTMAX_AIR`, ...), so the autopilot, the planner and
+the safety arbiter agree. On the remote machine, the map's regions are drawn
+in Gazebo (translucent; `solid: true` regions are real obstacles) and every
+flight is filmed by a chase camera that follows the drone (`gazebo.mp4`).
+Gazebo work runs through `src/avians/simside/avians_gz.py` inside AAS's
+simulation container.
+
+## QGroundControl: watching flights
+
+QGC shows LLM flights live; it never commands them.
+
+- **Laptop:** install the QGroundControl desktop app and open it. The container
+  sends PX4 SIH's MAVLink to `host.docker.internal:14550`, where QGC listens
+  (turn off with `AVIANS_QGC_HOST=` in `.env`).
+- **Linux machine:** AAS's ground container runs QGC already.
+- **Map regions:** `avians export-kml missions/slalom.yaml` writes them as a
+  KML overlay at the right latitude/longitude (the Gazebo world's location, or
+  PX4 SIH's home). Display only: never upload regions as a geofence, which
+  would enforce what the STL score is meant to measure.
+
 ## Known behaviour (read before debugging)
 
 | Symptom | Cause |
@@ -247,10 +295,26 @@ avians never cancels an AAS action: cancelling makes AAS climb to its abort
 altitude (100 m by default). `hover` and `abort` hold position with a
 reposition instead.
 
-## Remote AAS (not done yet)
+## Remote AAS (written, not yet run)
 
-The AAS side is ready to run unmodified from `external/aerial-autonomy-stack`
-(pinned commit in `meta.json` of every episode). Still to do on the Linux
-machine: build and run AAS with one quad, and run the avians container on the
-same ROS domain (1) and network as AAS's aircraft container, so `/Drone1/*`
-is visible. Then show QGroundControl and apply wind per mission.
+Everything for the Linux machine is in place but untested there. In order:
+
+1. **Bring up AAS** with one quad, then avians next to it:
+   `cd external/aerial-autonomy-stack/tools_and_docs && NUM_QUADS=1 WORLD=impalpable_greyness ./sim_run.sh`,
+   then `./scripts/up_remote.sh` (`docker/compose.remote.yml`: AAS's network,
+   ROS domain 1, subnet discovery, the docker socket, no local SIH).
+   Check `avians doctor` sees `/Drone1/*`. If ROS discovery fails across
+   containers (AAS's middleware), fall back to running avians inside the
+   aircraft container.
+2. **Step-by-step flight** (`--control step`) end to end, then the online
+   monitor's checks: the 1.3x speed margin against measured speeds, a stop
+   during takeoff.
+3. **Simulator plumbing:** `sim.profile: remote` (set by compose.remote.yml):
+   PX4 parameters, wind playback, region overlay, chase-camera video, `.ulg`.
+4. **Plan-ahead flight on AAS:** write the `avians_trajectory` controller in
+   AAS's `offboard_control` package (tracks the latest trajectory avians
+   publishes) and the small `px4_interface` patch that ends an offboard action
+   into Loiter without the abort climb; then `AasBackend.follow/end_follow`.
+5. **Tune the aggressive envelope** in Gazebo: x500 top speed, acceleration and
+   tilt, in calm air and in wind; tracking error of plans (planned vs flown
+   path in the plots).

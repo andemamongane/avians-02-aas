@@ -1,0 +1,25 @@
+# The Linux machine: avians next to a running aerial-autonomy-stack, instead of
+# its own PX4 SIH. Layered on compose.yml by scripts/up_remote.sh:
+#   - joins AAS's simulation network, on the drone's ROS domain (Drone1 = 1),
+#     discovering ROS nodes across that subnet instead of only localhost
+#   - does not start the local SIH stack (entrypoint: AVIANS_START_SIM=0)
+#   - reaches AAS's simulation container through the host's docker socket
+#     (sim.py: Gazebo wind, region overlay, recording, PX4 parameters)
+# Start AAS first: cd external/aerial-autonomy-stack/tools_and_docs &&
+#   NUM_QUADS=1 WORLD=impalpable_greyness ./sim_run.sh
+services:
+  avians:
+    environment:
+      AVIANS_START_SIM: "0"
+      ROS_DOMAIN_ID: "1"
+      ROS_AUTOMATIC_DISCOVERY_RANGE: SUBNET
+      AVIANS_SIM_PROFILE: remote
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - aas_sim
+
+networks:
+  aas_sim:
+    name: aas-sim-network-inst0      # created by AAS's sim_run.sh (INSTANCE=0)
+    external: true

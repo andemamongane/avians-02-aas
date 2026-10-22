@@ -26,6 +26,7 @@ from .tools import PlanToolLayer, ToolLayer
 
 REPO = Path(__file__).resolve().parents[2]
 CONFIG = REPO / "config"
+AAS_WORLDS = REPO / "external/aerial-autonomy-stack/simulation/simulation_resources/simulation_worlds"
 DATA = Path(os.environ.get("AVIANS_DATA", REPO / "data")) / "episodes"
 
 
@@ -85,6 +86,11 @@ def load_mission(path: str | Path) -> tuple[dict, str, Map | None]:
     from .monitor import POLICIES
     if mission.get("early_stop", "violated") not in POLICIES:
         raise SystemExit(f"{path}: early_stop must be one of {', '.join(POLICIES)}")
+    from .environment import Environment, EnvironmentError
+    try:
+        Environment.from_mission(mission)
+    except EnvironmentError as e:
+        raise SystemExit(f"{path}: {e}")
     if mission.get("control", "plan") not in CONTROLS:
         raise SystemExit(f"{path}: control must be one of {', '.join(CONTROLS)}")
     try:
@@ -149,12 +155,25 @@ def cmd_fly(args: argparse.Namespace) -> int:
     logger = TrajectoryLogger(episode)
     recorder = BagRecorder(episode, aas_cfg.get("record", []),
                            enabled=(args.backend != "fake"))
+    from .environment import Environment
+    from .sim import SimControl, SimError
+    env = Environment.from_mission(mission)
+    sim_cfg = aas_cfg.get("sim", {})
+    sim = (None if args.backend == "fake" else
+           SimControl(sim_cfg, episode, args.sim or os.environ.get("AVIANS_SIM_PROFILE")
+                      or sim_cfg.get("profile", "local")))
     started = time.time()
     result = None
     monitor = None
     executor = None
     try:
         backend.connect()
+        if sim is not None:
+            try:
+                sim.prepare(env, limits, mission_map)
+            except SimError as e:
+                print(f"[avians] the simulator is not ready, nothing flew: {e}")
+                return 2
         recorder.start()
         skills = Skills(
             backend,
@@ -187,6 +206,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
             system_prompt=build_system_prompt(mission_map, spec_for_agent, control, limits),
             monitor=monitor,
         )
+        if sim is not None:
+            sim.start(horizon_s=mission.get("max_wall_s", 300))
         result = runner.run(mission["name"], prompt, mission)
         print(f"[avians] {result.steps} steps, ended by {result.terminated_by}")
     finally:
@@ -195,6 +216,11 @@ def cmd_fly(args: argparse.Namespace) -> int:
         time.sleep(1.0 if args.backend != "fake" else 0.0)
         if executor is not None:
             executor.close()
+        if sim is not None:
+            try:
+                sim.stop()
+            except Exception as e:              # recordings are a bonus; the episode is not
+                print(f"[warn] simulator cleanup: {type(e).__name__}: {e}")
         recorder.stop()
         logger.close()
         backend.disconnect()
@@ -212,6 +238,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
         "backend": args.backend,
         "control": control,
         "envelope": limits_cfg["envelope"],
+        "environment": env.summary(),
+        "sim": sim.summary() if sim is not None else None,
         "dry_run": args.dry_run,
         "pilot": pilot_name,
         "pilot_label": "Scripted plan" if args.dry_run else pilot_label(pilot_name, pilots_cfg),
@@ -471,6 +499,36 @@ def _showcase_md(rows, missing, pilots_cfg) -> str:
     return "\n".join(lines) + "\n"
 
 
+def cmd_export_kml(args: argparse.Namespace) -> int:
+    """A mission's (or map's) regions as KML, for QGroundControl's map."""
+    from . import geo
+    src = Path(args.path)
+    doc = yaml.safe_load(src.read_text())
+    if "regions" in doc:
+        m, world = Map.load(src), args.world
+    else:
+        _, _, m = load_mission(src)
+        world = args.world or (doc.get("environment") or {}).get("world")
+    if m is None:
+        print(f"{src} has no map")
+        return 1
+    if args.origin:
+        lat, lon = (float(v) for v in args.origin.split(","))
+        origin, where = (lat, lon, 0.0), f"origin {lat}, {lon}"
+    elif world:
+        origin = geo.world_origin(AAS_WORLDS / f"{world}.sdf")
+        where = f"Gazebo world {world}"
+    else:
+        origin, where = geo.PX4_SIH_HOME, "PX4 SIH home"
+    out = Path(args.out or DATA.parent / f"{m.name}.kml")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(geo.kml(m, origin, name=m.name))
+    print(f"[avians] {out}  ({len(m.regions)} regions, launch point at {where})")
+    print("[avians] load it in QGroundControl as a KML overlay (the menu depends on the "
+          "QGC version); display only: never upload regions as a geofence")
+    return 0
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """Parse a mission's map and spec without flying; print what the agent sees."""
     mission, prompt, m = load_mission(args.mission)
@@ -562,6 +620,8 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--pilot", help="AI agent from config/pilots.yaml "
                    "(claude, deepseek, codex, ...); default: its `default`")
     f.add_argument("--backend", default="aas", choices=["aas", "fake"])
+    f.add_argument("--sim", choices=["local", "remote"],
+                   help="simulator profile (default: sim.profile in config/aas.yaml)")
     f.add_argument("--control", choices=["plan", "step"],
                    help="plan-ahead (missions default to it) or step-by-step (the baseline)")
     f.add_argument("--dry-run", action="store_true",
@@ -569,6 +629,13 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--no-plots", action="store_true",
                    help="skip generating plots after the flight")
     f.set_defaults(func=cmd_fly)
+
+    k = sub.add_parser("export-kml", help="a mission's or map's regions as KML for QGroundControl")
+    k.add_argument("path", help="mission or map yaml")
+    k.add_argument("--world", help="Gazebo world whose location is the launch point")
+    k.add_argument("--origin", help="launch point as lat,lon (default: the world's, else PX4 SIH home)")
+    k.add_argument("-o", "--out", help="output .kml (default: data/<map>.kml)")
+    k.set_defaults(func=cmd_export_kml)
 
     c = sub.add_parser("check", help="parse a mission's map and spec; print the agent's prompt")
     c.add_argument("mission")

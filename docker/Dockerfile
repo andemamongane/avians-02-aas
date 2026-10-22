@@ -98,6 +98,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
  && rm -rf /var/lib/apt/lists/* \
  && python3 -m pip install --break-system-packages --no-cache-dir openai
 
+# The docker CLI (client only), for sim.profile: remote, which reaches AAS's
+# simulation container through the host's docker socket (compose.remote.yml).
+ARG DOCKER_CLI=27.3.1
+RUN set -eux; \
+    arch=$(dpkg --print-architecture); \
+    case "$arch" in amd64) a=x86_64 ;; arm64) a=aarch64 ;; *) echo "no docker CLI for $arch"; exit 1 ;; esac; \
+    curl -fsSL "https://download.docker.com/linux/static/stable/${a}/docker-${DOCKER_CLI}.tgz" \
+      | tar -xz -C /usr/local/bin --strip-components=1 docker/docker; \
+    docker --version
+
 # The pinned AAS commit, recorded in every episode's meta.json. The submodule's
 # git dir lives in the parent repo's .git/modules (clone with --recursive).
 COPY .git/modules/external/aerial-autonomy-stack/HEAD /opt/aas_commit

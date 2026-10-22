@@ -31,6 +31,8 @@ envelopes:
     max_climb_ms: 4.0
     max_descent_ms: 3.0
     corner_radius_m: 6.0     # widest fillet on a fly-through corner
+    max_tilt_deg: 45.0       # PX4 only: headroom above the ~35 deg the planner uses
+    max_jerk_ms3: 20.0       # PX4 only
 
 min_battery_pct: 20.0      # only applies when the autopilot reports battery (AAS does not)
 max_hover_s: 60.0

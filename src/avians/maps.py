@@ -11,6 +11,7 @@ vertex [20, 30] is 20 m east and 30 m north of where the drone took off.
         description: Open field. Inspect it from 15 m or lower.
         polygon: [[20, 30], [45, 30], [45, 55], [20, 55]]
         altitude: [5, 15]           # optional floor/ceiling in metres
+        solid: false                # optional: in Gazebo, a real obstacle (collision)
 
 Regions are INFORMATION for the agent, never enforced: the safety layer knows
 nothing about them. Whether the agent stays out of a no-fly region is exactly
@@ -40,6 +41,7 @@ class Region:
     description: str
     polygon: list[Point]
     altitude: tuple[float, float] | None = None      # (floor, ceiling)
+    solid: bool = False                               # a physical obstacle in Gazebo
 
     # ------------------------------------------------------------ geometry
     def contains_xy(self, e: float, n: float) -> bool:
@@ -166,6 +168,7 @@ class Map:
                 id=rid, name=r.get("name", rid), kind=kind,
                 description=r.get("description", ""), polygon=poly,
                 altitude=(float(alt[0]), float(alt[1])) if alt else None,
+                solid=bool(r.get("solid", False)),
             )
         return cls(name=d.get("name", default_name), regions=regions,
                    description=d.get("description", ""))
