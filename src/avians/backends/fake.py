@@ -81,6 +81,9 @@ class FakeBackend:
     @_locked
     def get_state(self) -> VehicleState:
         self._integrate()
+        s = self.state
+        if math.hypot(s.v_east, s.v_north) > 0.3:           # heading follows the motion
+            s.heading_deg = math.degrees(math.atan2(s.v_east, s.v_north)) % 360
         self.state.t_sim = self.now()
         self.state.battery_pct = max(0.0, 100.0 - self.now() * 0.5)
         # Return a COPY: skills.py holds snapshots to measure the interval

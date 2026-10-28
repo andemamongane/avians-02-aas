@@ -683,6 +683,25 @@ def cmd_export_kml(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_dataset(args: argparse.Namespace) -> int:
+    """Episodes -> a fine-tuning dataset of pilot decisions (dataset.py)."""
+    from .dataset import Selection, export
+    sel = Selection(include_fake=args.include_fake, require_satisfied=not args.allow_violations,
+                    min_robustness=args.min_robustness, missions=tuple(args.missions or ()),
+                    pilots=tuple(args.pilots or ()))
+    out = Path(args.out or DATA.parent / "datasets" /
+               f"decisions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl")
+    manifest = export(DATA, out, sel)
+    print(f"[avians] {manifest['examples']} examples from {len(manifest['included'])} episodes "
+          f"-> {out}")
+    reasons: dict[str, int] = {}
+    for why in manifest["excluded"].values():
+        reasons[why] = reasons.get(why, 0) + 1
+    for why, k in sorted(reasons.items(), key=lambda kv: -kv[1]):
+        print(f"[avians]   excluded {k}: {why}")
+    return 0 if manifest["examples"] else 1
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """Parse a mission's map and spec without flying; print what the agent sees."""
     mission, prompt, m = load_mission(args.mission)
@@ -788,6 +807,18 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--no-plots", action="store_true",
                    help="skip generating plots after the flight")
     f.set_defaults(func=cmd_fly)
+
+    ds = sub.add_parser("export-dataset",
+                        help="episodes -> a fine-tuning dataset of pilot decisions (JSONL)")
+    ds.add_argument("--out", help="output .jsonl (default: data/datasets/decisions_<time>.jsonl)")
+    ds.add_argument("--include-fake", action="store_true",
+                    help="also fake-backend episodes (noise-free physics: development only)")
+    ds.add_argument("--allow-violations", action="store_true",
+                    help="also episodes whose spec was not satisfied")
+    ds.add_argument("--min-robustness", type=float, help="keep only this STL margin or more")
+    ds.add_argument("--missions", nargs="+", help="mission names; default: all")
+    ds.add_argument("--pilots", nargs="+", help="pilot names; default: all")
+    ds.set_defaults(func=cmd_export_dataset)
 
     k = sub.add_parser("export-kml", help="a mission's or map's regions as KML for QGroundControl")
     k.add_argument("path", help="mission or map yaml")

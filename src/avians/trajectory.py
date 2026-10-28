@@ -358,7 +358,7 @@ def build(start: Vec, v0: Vec, knots: list[Knot], env: Envelope) -> Trajectory:
 
     knot_times = [times[i] for i in knot_idx]
     # an event at a hold says it is done: it fires when the hold ends
-    events = [(tk + (k.dwell or 0.0), k.label) for k, tk in zip(knots, knot_times) if k.label]
+    events = sorted((tk + (k.dwell or 0.0), k.label) for k, tk in zip(knots, knot_times) if k.label)
     return Trajectory(t_out, p_out, v_out, events=events, knots=list(knots),
                       knot_times=knot_times, lands=bool(knots and knots[-1].land))
 
@@ -440,7 +440,7 @@ def _tangent(pts: list[Vec], i: int, h: int = 1) -> Vec:
 # ---------------------------------------------------------------- preview
 def preview(traj: Trajectory, m: Map | None) -> str:
     """What the pilot is told about an accepted plan: geometry only."""
-    lines = [f"plan: {traj.length:.0f} m, {traj.duration:.0f} s, "
+    lines = [f"accepted plan: {traj.length:.0f} m, {traj.duration:.0f} s, "
              f"top speed {traj.top_speed:.1f} m/s"
              + (", ends with a landing at the launch point" if traj.lands else "")]
     for t, label in traj.events:

@@ -65,7 +65,8 @@ avians plot --all                                 # figures for every episode
 avians video 4                                    # episode 4 as an MP4
 avians showcase --fly                             # every mission x pilot, filmed
 avians compare-controls --fly --backend fake       # every mission plan-ahead vs step-by-step, filmed
-pytest                                            # 185 offline tests
+avians export-dataset                             # episodes -> fine-tuning examples (one per decision)
+pytest                                            # 190 offline tests
 ```
 
 Keep the laptop awake during a flight. If the host sleeps, the simulator
@@ -253,6 +254,19 @@ data/episodes/ep_0004/
 ├── adp.json           # ADP-style action/observation trajectory
 └── plots/             # ground track with regions, altitude, timeline, summary.md
 ```
+
+## Fine-tuning data
+
+`avians export-dataset` turns episodes into a JSONL dataset of pilot
+decisions (`src/avians/dataset.py`). Under plan-ahead control every model call
+is self-contained, so each one is a training example: the system prompt, the
+tools, the prompt the teacher saw, and its reply (decision, reason, notes),
+with the episode's outcome attached for finer selection later. By default it
+keeps plan-ahead episodes whose spec was satisfied, flown on a simulator
+(`--include-fake` to add the noise-free fake backend), never suspended
+mid-flight, and not scripted; a manifest next to the file lists what was left
+out and why. Check each provider's terms on training with its outputs before
+using a dataset.
 
 ## Online scoring and early stop
 
