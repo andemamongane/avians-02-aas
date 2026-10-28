@@ -18,7 +18,7 @@ from .schema import (
     Observation, ToolArgError, validate_tool_args,
 )
 from .skills import ActionOutcome, Skills
-from .trajectory import ALONG
+from .trajectory import STRAIGHT
 from . import clock
 
 
@@ -272,6 +272,7 @@ class DecisionToolLayer(PlanToolLayer):
             obs = self._check_path(clean["east"], clean["north"])
             return self._plan_obs(obs.status, obs.reason, obs.info)
         ex = self.ex
+        ex.authorize()                                # any decision renews the dead-man's switch
         n0 = len(ex.events)                           # events from here on wake the pilot,
         try:                                          # including any during the latency
             if self.latency_s > 0 and ex.phase not in ("ground", "landed"):
@@ -317,7 +318,7 @@ class DecisionToolLayer(PlanToolLayer):
         discovered = getattr(self.map, "discovered", {})
         st = self.backend.get_state()
         speed = math.hypot(st.v_east, st.v_north)
-        brake = speed * speed / (2 * ALONG * self.ex.env.max_accel) + speed * self.latency_s
+        brake = speed * speed / (2 * STRAIGHT * self.ex.env.max_accel) + speed * self.latency_s
         stopping = (f" At {speed:.1f} m/s the drone needs about {brake:.0f} m to stop, counting "
                     f"from now." if speed > 0.5 else "")
         parts = [

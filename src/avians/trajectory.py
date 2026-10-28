@@ -31,7 +31,8 @@ from .maps import Map
 from .schema import ToolArgError
 
 Vec = tuple[float, float, float]
-LATERAL, ALONG = 0.7, 0.6            # shares of max_accel: |(0.7, 0.6)| = 0.92
+LATERAL, ALONG = 0.7, 0.6            # shares of max_accel in turns: |(0.7, 0.6)| = 0.92
+STRAIGHT = 0.95                      # ... and along the path where it does not turn
 SEGMENT_TYPES = ("waypoint", "region", "orbit", "survey", "hold", "land")
 MAX_SEGMENTS = 60
 
@@ -263,11 +264,16 @@ def build(start: Vec, v0: Vec, knots: list[Knot], env: Envelope) -> Trajectory:
     s0 = _norm(v0)                    # climbing after takeoff should not keep climbing
     if s0 > 0.3:
         # Carry the momentum: the path first continues along the current
-        # velocity for as far as it takes to brake (plus the corner's fillet),
-        # then turns, instead of starting with a velocity jump.
-        lead = min(s0 * s0 / (2 * ALONG * env.max_accel) + env.corner_radius, 40.0)
+        # velocity, without speeding up, for as far as it takes to slow to the
+        # speed of a tightest corner (and that corner's fillet), then turns,
+        # instead of starting with a velocity jump. Not to a full stop: that
+        # would carry a fast drone tens of metres on, into whatever it was
+        # turning away from.
+        v_turn = math.sqrt(LATERAL * env.max_accel * env.corner_radius)
+        lead = (max(0.0, s0 * s0 - v_turn * v_turn) / (2 * STRAIGHT * env.max_accel)
+                + env.corner_radius)
         u = _scale(v0, 1 / s0)
-        verts.append(Knot(_add(start, _scale(u, lead)), env.max_speed))
+        verts.append(Knot(_add(start, _scale(u, min(lead, 40.0))), s0))
     verts += knots
     if len(verts) == 1:
         verts.append(Knot(start, env.max_speed, dwell=0.0))
@@ -302,10 +308,15 @@ def build(start: Vec, v0: Vec, knots: list[Knot], env: Envelope) -> Trajectory:
     ds = [0.0] + [math.dist(pts[i - 1], pts[i]) for i in range(1, n)]
     v = list(caps)
     w = max(1, round(1.0 / env.ds))          # 1 m stencil: curvature without chord noise
+    # speeding up and braking: nearly the whole budget on straight stretches,
+    # the ALONG share where the path turns (the rest goes to the turn)
+    along = [STRAIGHT * env.max_accel] * n
     for i in range(n):
         kappa = _curvature(pts[max(0, i - w)], pts[i], pts[min(n - 1, i + w)])
         if kappa > 1e-9:
             v[i] = min(v[i], math.sqrt(LATERAL * env.max_accel / kappa))
+        if kappa > 1e-3:                     # tighter than a 1 km radius: a turn
+            along[i] = ALONG * env.max_accel
         if i > 0 and ds[i] > 1e-9:
             dz = (pts[i][2] - pts[i - 1][2]) / ds[i]
             if dz > 1e-6:
@@ -322,7 +333,7 @@ def build(start: Vec, v0: Vec, knots: list[Knot], env: Envelope) -> Trajectory:
     # right angle), the real acceleration still overshoots. Measure it and
     # lower the speed there until the whole trajectory is inside the envelope.
     for _ in range(30):
-        _passes(v, ds, ALONG * env.max_accel)
+        _passes(v, ds, along)
         times = _times(v, ds, env.max_accel)
         over = [i for i in range(1, n) if times[i] - times[i - 1] > 1e-9 and _norm(_sub(
             _scale(tans[i], v[i]), _scale(tans[i - 1], v[i - 1]))) / (times[i] - times[i - 1])
@@ -332,7 +343,7 @@ def build(start: Vec, v0: Vec, knots: list[Knot], env: Envelope) -> Trajectory:
         for i in over:
             v[i] *= 0.85
             v[i - 1] *= 0.85
-    _passes(v, ds, ALONG * env.max_accel)
+    _passes(v, ds, along)
     times = _times(v, ds, env.max_accel)
 
     t_out, p_out, v_out = [], [], []
@@ -352,13 +363,14 @@ def build(start: Vec, v0: Vec, knots: list[Knot], env: Envelope) -> Trajectory:
                       knot_times=knot_times, lands=bool(knots and knots[-1].land))
 
 
-def _passes(v: list[float], ds: list[float], a: float) -> None:
-    """Forward (accelerate) and backward (brake) passes, in place."""
+def _passes(v: list[float], ds: list[float], a: list[float]) -> None:
+    """Forward (accelerate) and backward (brake) passes, in place; a[i] is
+    the acceleration allowed along the path at point i."""
     n = len(v)
     for i in range(1, n):
-        v[i] = min(v[i], math.sqrt(v[i - 1] ** 2 + 2 * a * ds[i]))
+        v[i] = min(v[i], math.sqrt(v[i - 1] ** 2 + 2 * min(a[i - 1], a[i]) * ds[i]))
     for i in range(n - 2, -1, -1):
-        v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2 * a * ds[i + 1]))
+        v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2 * min(a[i], a[i + 1]) * ds[i + 1]))
 
 
 def _times(v: list[float], ds: list[float], a: float) -> list[float]:

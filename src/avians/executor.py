@@ -26,7 +26,7 @@ import time
 from .maps import Map
 from .safety import SafetyArbiter
 from .schema import ABORTED, BLOCKED, FAILED, OK, REJECTED, ToolArgError
-from .trajectory import ALONG, Envelope, Knot, Trajectory, build, expand, preview
+from .trajectory import STRAIGHT, Envelope, Knot, Trajectory, build, expand, preview
 from . import clock
 
 
@@ -42,11 +42,14 @@ class PlanExecutor:
         self.poll_dt = 1.0 / poll_hz
         self.land_timeout = land_timeout
         self.threaded = threaded
-        # Receding horizon: a plan covers at most horizon_s of flight, so the
-        # pilot keeps deciding from fresh observations; "plan ends in N s"
-        # is its cue. hold and land are exempt: they are the safe exits.
+        # Dead-man's switch: each decision authorises horizon_s of flight
+        # (authorize()). If no decision comes within that, the drone brakes and
+        # holds: a stalled or lost pilot never flies far on old instructions.
+        # Plans may be any length; a plan ending with a landing is finished.
+        # "plan ends in N s" is the pilot's cue to extend a plan.
         self.horizon_s = horizon_s
         self.plan_ending_s = plan_ending_s
+        self.authorized_until: float | None = None
         self.phase = "ground"
         self.traj: Trajectory | None = None
         self.traj_t0 = 0.0
@@ -104,8 +107,7 @@ class PlanExecutor:
                                       "since": self.mission_time()}
             return OK, f"climbing to {altitude:g} m; send a plan, it starts when the climb completes", ""
 
-    def fly_plan(self, segments: list, mode: str = "replace",
-                 capped: bool = True) -> tuple[str, str, str]:
+    def fly_plan(self, segments: list, mode: str = "replace") -> tuple[str, str, str]:
         with self._lock:
             if self.phase in ("ground", "landed"):
                 return BLOCKED, "the drone is not airborne; call takeoff first", ""
@@ -113,11 +115,10 @@ class PlanExecutor:
                 return BLOCKED, "the drone is landing", ""
             try:
                 if self.phase == "takeoff":
-                    return self._queue(segments, mode, capped)
+                    return self._queue(segments, mode)
                 start, v0 = self._reference()
                 knots = self._knots(segments, mode, start)
-                return self._fly(build(start, v0, knots, self.env),
-                                 "plan accepted, flying it now", capped)
+                return self._fly(build(start, v0, knots, self.env), "plan accepted, flying it now")
             except ToolArgError as e:
                 return REJECTED, str(e), ""
 
@@ -129,13 +130,18 @@ class PlanExecutor:
             speed = math.sqrt(sum(c * c for c in v0))
             stop = start
             if speed > 0.1:
-                d = speed * speed / (2 * ALONG * self.env.max_accel) * 1.1
+                d = speed * speed / (2 * STRAIGHT * self.env.max_accel) * 1.1
                 stop = tuple(start[i] + v0[i] / speed * d for i in range(3))
             knots = [Knot(stop, self.env.max_speed, dwell=0.0, label="stopped, hovering")]
-            return self._fly(build(start, v0, knots, self.env), "braking to a hover", capped=False)
+            return self._fly(build(start, v0, knots, self.env), "braking to a hover")
 
     def land(self) -> tuple[str, str, str]:
-        return self.fly_plan([{"type": "land"}], capped=False)
+        return self.fly_plan([{"type": "land"}])
+
+    def authorize(self) -> None:
+        """A decision was made: the drone may fly horizon_s further."""
+        if self.horizon_s:
+            self.authorized_until = self.backend.now() + self.horizon_s
 
     def wait(self, seconds: float, until: str = "event",
              since: int | None = None) -> tuple[str, str, str]:
@@ -203,7 +209,8 @@ class PlanExecutor:
             if self.map is not None and self.phase != "ground":
                 if hasattr(self.map, "sense"):           # range-limited sensor
                     for r in self.map.sense(st.east, st.north, t):
-                        self._event(f"discovered {r.id} [{r.kind}] \"{r.name}\" (now on your map)")
+                        self._event(f"discovered {r.id} [{r.kind}] \"{r.name}\" (now on your map)"
+                                    + self._conflict(r))
                 now_in = set(self.map.inside(st.east, st.north, st.alt))
                 for rid in sorted(now_in - self._inside):
                     self._event(f"entered {rid}")
@@ -245,6 +252,11 @@ class PlanExecutor:
                         and 0 < left <= self.plan_ending_s):
                     self._warned_ending = True
                     self._event(f"plan ends in {left:.0f} s")
+                if (self.authorized_until is not None and not self.traj.lands
+                        and not self._plan_done and self.backend.now() >= self.authorized_until):
+                    self.authorized_until = None           # dead-man's switch
+                    self._event(f"no decision for {self.horizon_s:g} s: braking to a hover")
+                    self.hold()
                 if not self._plan_done and elapsed >= self.traj.duration:
                     self._plan_done = True
                     if self.traj.lands:
@@ -266,7 +278,7 @@ class PlanExecutor:
             return why
 
     # --- internals ------------------------------------------------------------
-    def _queue(self, segments: list, mode: str, capped: bool = True) -> tuple[str, str, str]:
+    def _queue(self, segments: list, mode: str) -> tuple[str, str, str]:
         st = self.backend.get_state()
         start = (st.east, st.north, self.takeoff_alt)
         if mode == "append" and self.pending:
@@ -276,8 +288,6 @@ class PlanExecutor:
             knots = expand(segments, start, self.env, self.map)
         traj = build(start, (0.0, 0.0, 0.0), knots, self.env)
         ok, reason = self.arbiter.check_plan(traj, st)
-        if ok and capped:
-            ok, reason = self._within_horizon(traj)
         if not ok:
             return REJECTED, reason, ""
         self.pending = knots
@@ -292,17 +302,8 @@ class PlanExecutor:
             return rest + expand(segments, here, self.env, self.map)
         return expand(segments, start, self.env, self.map)
 
-    def _within_horizon(self, traj: Trajectory) -> tuple[bool, str]:
-        if self.horizon_s and traj.duration > self.horizon_s + 0.5:
-            return False, (f"the plan covers {traj.duration:.0f} s of flight; commit at most "
-                           f"{self.horizon_s:g} s now and extend it as you go (append, or replace "
-                           f"with a new plan)")
-        return True, ""
-
-    def _fly(self, traj: Trajectory, message: str, capped: bool = True) -> tuple[str, str, str]:
+    def _fly(self, traj: Trajectory, message: str) -> tuple[str, str, str]:
         ok, reason = self.arbiter.check_plan(traj, self.backend.get_state())
-        if ok and capped:
-            ok, reason = self._within_horizon(traj)
         if not ok:
             return REJECTED, reason, ""
         h = self.backend.follow(traj)
@@ -323,6 +324,17 @@ class PlanExecutor:
 
     def env_min_alt(self) -> float:
         return self.arbiter.limits.min_altitude_m
+
+    def _conflict(self, region) -> str:
+        """Whether the rest of the current plan passes through a region just
+        discovered: the pilot planned it without knowing the region was there."""
+        if self.phase != "flying" or self.traj is None or self._plan_done:
+            return ""
+        el = self.backend.now() - self.traj_t0
+        for tk, p in zip(self.traj.t, self.traj.pos):
+            if tk >= el and region.contains(*p):
+                return f"; your plan enters it in {tk - el:.1f} s"
+        return ""
 
     def mission_time(self) -> float:
         return self.backend.now() - self.t_start
@@ -353,14 +365,10 @@ class PlanExecutor:
             el = self.backend.now() - self.traj_t0
             left = self.traj.duration - el
             if left <= 0:
-                return ("complete; the drone is holding at its last point"
-                        + (f"; a new plan may cover up to {self.horizon_s:g} s" if self.horizon_s
-                           else ""))
+                return "complete; the drone is holding at its last point"
             upcoming = [f"t+{tk - el:.0f} s {label}" for tk, label in self.traj.events if tk > el]
-            room = (f"; you can append up to {max(0.0, self.horizon_s - left):.0f} s more"
-                    if self.horizon_s and not self.traj.lands else "")
             return (f"{left:.0f} s of plan left" + (" (ends with the landing)" if self.traj.lands
-                                                    else "") + room +
+                                                    else "") +
                     ("; next: " + "; ".join(upcoming[:4]) if upcoming else ""))
 
     def started_plan(self) -> tuple[Trajectory, float] | None:

@@ -197,8 +197,9 @@ point (an event such as a segment completed, a region entered or discovered,
 "plan ends in N s"; or every 3 s at most) the pilot gets a fresh,
 self-contained observation and makes one decision: `keep`, `fly_plan` (a new or
 extended plan), `hold` or `land`. The drone flies continuously between
-decisions. A plan covers at most 15 s of flight, so the pilot keeps deciding
-from what it currently observes; replacing a plan keeps the drone's momentum.
+decisions; replacing a plan keeps the drone's momentum. Plans may be any
+length, but every decision (keep included) authorises only the next 15 s of
+flight: if the pilot stops deciding, the drone brakes and holds.
 Each decision can carry the pilot's own `notes` (its memory) and a `reason`.
 Every turn is one complete training example. Details and settings:
 `docs/tool_api.md`.

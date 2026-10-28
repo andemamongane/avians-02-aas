@@ -37,10 +37,10 @@ Every turn is one complete training example.
 | Decision | Arguments | Effect |
 |---|---|---|
 | `takeoff` | `altitude` | climb; the first plan follows |
-| `fly_plan` | `segments`, optional `mode` (`replace` / `append`) | a new plan from where the drone is (momentum kept), or an extension; at most `horizon_s` of flight |
+| `fly_plan` | `segments`, optional `mode` (`replace` / `append`) | a new plan from where the drone is (momentum kept), or an extension; any length |
 | `keep` | none | fly on unchanged |
-| `hold` | none | brake along the course and hover (not capped) |
-| `land` | none | straight to the launch point at the current altitude, then land (not capped) |
+| `hold` | none | brake along the course and hover |
+| `land` | none | straight to the launch point at the current altitude, then land |
 | `check_path` | `east`, `north` | free: answers at once and does not use up the turn |
 
 Every decision may carry `notes` (the pilot's memory, shown back every turn,
@@ -53,7 +53,7 @@ N s", landed) or `wake_s` at most. Settings, in `config/limits.yaml` under
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `horizon_s` | 15 | a plan covers at most this much flight; the plan report says how much room is left |
+| `horizon_s` | 15 | dead-man's switch: each decision (keep included) authorises this much flight; with no decision within it the drone brakes and holds (a plan ending with a landing is finished) |
 | `wake_s` | 3 | the pilot decides again at the next event, or within this |
 | `plan_ending_s` | 7 | the "plan ends in N s" event: at least `wake_s` + `latency_s` + a margin |
 | `latency_s` | 1 | lockstep only: a decision takes effect this long after its observation |

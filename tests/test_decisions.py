@@ -61,16 +61,36 @@ def test_lockstep_time_only_moves_when_avians_moves_it():
 
 
 # --- the receding horizon --------------------------------------------------------------------
-def test_plans_longer_than_the_horizon_are_refused_but_exits_are_not(stack):
-    _, ex, tools = stack
+def test_long_plans_fly_while_the_pilot_keeps_deciding(stack):
+    """Plans may be any length; every decision, keep included, renews the
+    15 s the drone may fly on it."""
+    backend, ex, tools = stack
     airborne(tools)
-    obs = tools.dispatch("fly_plan", {"segments": [WP(120, 0), WP(0, 0)]})   # ~240 m
-    assert obs.status == REJECTED and "commit at most 15 s" in obs.reason
-    assert tools.dispatch("fly_plan", {"segments": [WP(60, 0)]}).status == OK
-    for _ in range(3):
-        tools.dispatch("keep", {})
-    assert tools.dispatch("hold", {}).status == OK      # exits are never capped
-    assert tools.dispatch("land", {}).status == OK
+    assert tools.dispatch("fly_plan", {"segments": [WP(120, 0), WP(0, 0)]}).status == OK  # ~240 m
+    for _ in range(4):                                   # ~12 s of decisions
+        obs = tools.dispatch("keep", {})
+        assert not any("no decision" in e for e in obs.events)
+    assert backend.get_state().speed > 3                 # still flying the ~20 s plan
+    ex.wait(14.0, "plan_complete")                       # and it completes in full
+    assert abs(backend.get_state().east) < 0.5
+
+
+def test_the_dead_mans_switch_holds_a_drone_nobody_is_deciding_for(stack):
+    backend, ex, tools = stack
+    airborne(tools)
+    tools.dispatch("fly_plan", {"segments": [WP(120, 0), WP(0, 0)]})
+    ex.wait(16.0, "time")                                # the pilot goes silent
+    assert any("no decision for 15 s: braking to a hover" in e for e in ex.events)
+    ex.wait(4.0, "time")
+    assert backend.get_state().speed < 0.1
+
+
+def test_a_landing_is_finished_even_without_decisions(stack):
+    backend, ex, tools = stack
+    airborne(tools)
+    tools.dispatch("fly_plan", {"segments": [WP(60, 0), WP(60, 60), {"type": "land"}]})
+    ex.wait(60.0, "landed")
+    assert ex.phase == "landed" and not any("no decision" in e for e in ex.events)
 
 
 def test_the_plan_ending_warning_comes_once_in_time_to_extend(stack):
@@ -149,14 +169,14 @@ def test_the_decision_prompt_is_self_contained(stack):
                     "YOUR LAST DECISIONS"):
         assert section in prompt
     assert "survey_a" in prompt and "detour north of the lines" in prompt
-    assert "paused while you decide" in prompt and "you can append up to" in prompt
+    assert "paused while you decide" in prompt and "s of plan left" in prompt
 
 
 def test_the_system_prompt_has_no_map_under_plan_control(field_map):
     plan = build_system_prompt(field_map, "F[0,10] in(survey_a)", "plan", AGGRESSIVE,
                                decisions={"horizon_s": 15, "wake_s": 3})
     assert "survey_a" not in plan.split("Requirements")[0]   # the map is per decision
-    assert "at most 15 s" in plan and "within 3 s" in plan
+    assert "the next 15 s of flight" in plan and "within 3 s" in plan
     assert "survey_a" in build_system_prompt(field_map, None, "step")
 
 

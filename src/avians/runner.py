@@ -73,11 +73,13 @@ How control works:
 - The drone flies continuously between decisions. You decide again at the next
   event or within {wake:g} s, whichever comes first. Events include segments
   completed, regions entered or left, regions discovered, and "plan ends in N s".
-- Plan a receding horizon. A plan may cover at most {horizon:g} s of flight:
-  commit to the next part of the route, then extend or change it as you learn
-  more (fly_plan with mode "append" to extend; the default "replace" starts a
-  new plan from where the drone is, keeping its momentum). Before your plan runs
-  out, extend it; if it runs out, the drone stops and holds.
+- Plan a receding horizon: commit to the next part of the route, then extend
+  or change it as you learn more (fly_plan with mode "append" to extend; the
+  default "replace" starts a new plan from where the drone is, keeping its
+  momentum). Extend a plan before it runs out ("plan ends in N s" is your cue);
+  if it runs out, the drone stops and holds. Every decision, keep included,
+  authorises the next {horizon:g} s of flight: if you stopped deciding, the
+  drone would brake and hold after that.
 - Decide from the current observation. Keep the plan when nothing calls for a
   change; change it when something you observe does. Do not change it for no
   reason.
