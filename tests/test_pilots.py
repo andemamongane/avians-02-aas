@@ -48,6 +48,28 @@ def test_anthropic_round_trip():
                                             "content": "status: arrived"}
 
 
+def test_anthropic_returns_summarized_thinking_and_keeps_it_for_the_next_call():
+    """Current Claude models return empty thinking text unless asked: the pilot
+    asks for the summary (kept for distillation) and passes the block back as is."""
+    thought = Item(type="thinking", thinking="Lines block the straight path; detour west.",
+                   signature="sig")
+    rec = Recorder([NS(content=[thought, Item(type="tool_use", id="tu1", name="takeoff",
+                                              input={"altitude": 5})],
+                       stop_reason="tool_use", usage=NS(input_tokens=10, output_tokens=5))])
+    p = AnthropicPilot("claude-x", "k", client=NS(messages=rec), effort="high")
+    p.start("sys", TOOL_SPECS, "fly")
+    r = p.step()
+    assert rec.calls[0]["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert rec.calls[0]["output_config"] == {"effort": "high"}
+    assert rec.calls[0]["max_tokens"] >= 16000            # thinking counts towards it
+    assert r.content[0] == {"type": "thinking",
+                            "text": "Lines block the straight path; detour west."}
+    assert p.messages[-1]["content"][0]["signature"] == "sig"   # passed back unchanged
+    quiet = AnthropicPilot("claude-x", "k", client=NS(messages=Recorder([])),
+                           thinking_display="omitted")
+    assert quiet.thinking["display"] == "omitted" and quiet.output_config is None
+
+
 # --- OpenAI-compatible chat (DeepSeek) ------------------------------------------
 def _chat_reply(content="", reasoning=None, calls=(), finish="tool_calls"):
     msg = NS(content=content, reasoning_content=reasoning, tool_calls=[

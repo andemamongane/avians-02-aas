@@ -58,24 +58,33 @@ def _parse_args(raw: str | None) -> dict[str, Any]:
 
 # ------------------------------------------------------------------ Anthropic
 class AnthropicPilot:
+    """Claude, with adaptive thinking. Current models return thinking blocks
+    with empty text unless display is "summarized"; the summary is what the
+    episode keeps of the reasoning (for distillation). The raw chain of thought
+    is never returned. Thinking counts towards max_tokens, hence the headroom."""
     provider = "anthropic"
 
-    def __init__(self, model: str, api_key: str, max_tokens: int = 1024, client=None, **_):
+    def __init__(self, model: str, api_key: str, max_tokens: int = 16000, client=None,
+                 thinking_display: str = "summarized", effort: str | None = None, **_):
         if client is None:
             import anthropic
             client = anthropic.Anthropic(api_key=api_key)
         self.client, self.model, self.max_tokens = client, model, max_tokens
+        self.thinking = {"type": "adaptive", "display": thinking_display}
+        self.output_config = {"effort": effort} if effort else None
 
     def start(self, system: str, tools: list[dict], prompt: str) -> None:
         self.system, self.tools = system, tools
         self.messages: list[dict] = [{"role": "user", "content": prompt}]
 
     def step(self) -> Reply:
+        kw = {"output_config": self.output_config} if self.output_config else {}
         r = self.client.messages.create(
             model=self.model, max_tokens=self.max_tokens,
             # identical for every call in an episode, so cached
             system=[{"type": "text", "text": self.system, "cache_control": {"type": "ephemeral"}}],
             tools=self.tools, messages=self.messages,
+            thinking=self.thinking, **kw,
         )
         native = [b.model_dump() if hasattr(b, "model_dump") else b for b in r.content]
         self.messages.append({"role": "assistant", "content": native})
