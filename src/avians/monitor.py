@@ -31,6 +31,7 @@ from pathlib import Path
 
 from .maps import Map
 from .stl import FutureBounds, Trace, logic_module
+from . import clock
 
 POLICIES = ("off", "violated", "decided")
 
@@ -71,7 +72,7 @@ class OnlineMonitor:
     # --- lifecycle -------------------------------------------------------
     def start(self) -> None:
         """Start the mission clock (call right after logging the mission)."""
-        self._t0 = time.time()
+        self._t0 = clock.now()
         self.sample()
         if self.threaded:
             self._running = True
@@ -94,7 +95,7 @@ class OnlineMonitor:
     def _loop(self) -> None:
         while self._running:
             self.sample()
-            time.sleep(self.period)
+            clock.sleep(self.period)
 
     # --- sampling and scoring ---------------------------------------------
     def poll(self) -> str | None:
@@ -110,7 +111,7 @@ class OnlineMonitor:
         if not st.ok:
             return
         with self._lock:
-            t = time.time() - self._t0
+            t = clock.now() - self._t0
             tr = self.trace
             if tr.t and t <= tr.t[-1]:
                 return

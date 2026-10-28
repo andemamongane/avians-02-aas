@@ -1,4 +1,4 @@
-# Tool and observation spec (schema_version 3)
+# Tool and observation spec (schema_version 4)
 
 The authority is `src/avians/schema.py`; this document explains it.
 
@@ -24,17 +24,50 @@ A mission flies under one of two tool sets (`control:` in the mission, or
 - **step**: the step-by-step baseline. Every flight tool blocks until the drone
   has arrived, so the drone hovers whenever the model thinks.
 
-## Plan tools
+## Plan-ahead: decisions on a receding horizon
 
-| Tool | Arguments | Returns |
+Under plan-ahead control the pilot flies by making **one decision per turn**,
+each from a fresh, self-contained observation (`tools.DecisionToolLayer`,
+`runner._decision_loop`). A turn is one request with no conversation history
+beyond what its prompt holds: the mission, the current state, the events since
+the last decision, the rest of the plan, the time spent in each region, the
+map as the pilot knows it, the pilot's own notes and its last few decisions.
+Every turn is one complete training example.
+
+| Decision | Arguments | Effect |
 |---|---|---|
-| `get_state` | none | immediately |
-| `takeoff` | `altitude` | immediately; a plan sent during the climb starts when it completes |
-| `fly_plan` | `segments`, optional `mode` (`replace` / `append`) | immediately, with a preview |
-| `wait` | `seconds`, optional `until` (`event` / `plan_complete` / `landed`) | at that, or after `seconds` |
-| `hold` | none | immediately; the drone brakes along its course and hovers |
-| `land` | none | immediately; straight to the launch point at the current altitude, then lands |
-| `check_path` | `east`, `north` | immediately |
+| `takeoff` | `altitude` | climb; the first plan follows |
+| `fly_plan` | `segments`, optional `mode` (`replace` / `append`) | a new plan from where the drone is (momentum kept), or an extension; at most `horizon_s` of flight |
+| `keep` | none | fly on unchanged |
+| `hold` | none | brake along the course and hover (not capped) |
+| `land` | none | straight to the launch point at the current altitude, then land (not capped) |
+| `check_path` | `east`, `north` | free: answers at once and does not use up the turn |
+
+Every decision may carry `notes` (the pilot's memory, shown back every turn,
+replacing the previous notes) and `reason` (one sentence, logged for training).
+
+After a decision the drone flies on to the **next decision point**: an event
+(segment completed, region entered or left, region discovered, "plan ends in
+N s", landed) or `wake_s` at most. Settings, in `config/limits.yaml` under
+`decisions:` (a mission can override them):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `horizon_s` | 15 | a plan covers at most this much flight; the plan report says how much room is left |
+| `wake_s` | 3 | the pilot decides again at the next event, or within this |
+| `plan_ending_s` | 7 | the "plan ends in N s" event: at least `wake_s` + `latency_s` + a margin |
+| `latency_s` | 1 | lockstep only: a decision takes effect this long after its observation |
+| `history` | 3 | the pilot sees its last N decisions |
+
+**Clock.** `--clock lockstep` (default on the fake backend, for data): the
+simulation stands still while the model thinks, and each decision takes effect
+`latency_s` later, so the data does not depend on how long the teacher took.
+`--clock realtime` (demos, AAS): the drone keeps flying while the model thinks.
+
+**Sensor.** A mission can hide regions until the drone comes within range
+(`sensor: {range_m, hidden: [...]}`, `sensing.py`): they then appear on the
+pilot's map and the next observation reports `discovered <region>`. Scoring
+always uses the full map.
 
 Segments, in order:
 
@@ -102,10 +135,9 @@ signed distance to every region's boundary (+ inside). `check_path` adds an
 `info` line. `detections` is always empty in this milestone.
 
 Plan control adds `plan_status` (what the plan is doing), `events` (what
-happened since the pilot's last call: segments completed, regions entered or
-left, the plan completing, landing), and, for plots only (never sent to the
-model), `plan_path` and `plan_age_s` for a plan that started since the last
-observation.
+happened since the pilot's last decision), and, for plots only (never sent to
+the model), `plan_path` and `plan_age_s` for a plan that started since the
+last observation.
 
 Two clocks are recorded on every observation: `t_sim` (PX4 timestamp) and
 `t_wall` (host).

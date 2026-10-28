@@ -65,7 +65,7 @@ avians plot --all                                 # figures for every episode
 avians video 4                                    # episode 4 as an MP4
 avians showcase --fly                             # every mission x pilot, filmed
 avians compare-controls --fly --backend fake       # every mission plan-ahead vs step-by-step, filmed
-pytest                                            # 164 offline tests
+pytest                                            # 185 offline tests
 ```
 
 Keep the laptop awake during a flight. If the host sleeps, the simulator
@@ -100,6 +100,10 @@ the end. Everything comes from what the episode recorded.
 (`showcase:` in `config/pilots.yaml`) into `data/showcase/<mission>/<pilot>.mp4`,
 plus `compare.mp4` with all pilots side by side on one clock, and an index
 `data/showcase/README.md`. Add `--fly` to fly the missing pairs first.
+
+`missions/slalom_blind.yaml` hides the course's walls until the drone's
+35 m sensor reaches them (`sensor:` in the mission): the gaps are learned during
+the flight, a stand-in for camera and lidar.
 
 `avians compare-controls` flies every mission with the same pilot and flight
 envelope under both control modes (`--fly`; `--refly` to redo them) and films
@@ -188,20 +192,21 @@ re-scored less often (the monitor spends at most a fifth of its time scoring).
 Pilots fly under one of two control modes (`control:` in the mission, or
 `avians fly --control plan|step`).
 
-**Plan-ahead (default).** The pilot commits to a whole flight plan, and the
-drone flies it continuously while the pilot keeps thinking. Every call returns
-at once; what happened in between arrives as events. Waypoints are flown
-through, corners are rounded, and the drone slows only where a turn or a
-required stop demands it. A new plan replaces the old one without stopping.
+**Plan-ahead (default): one decision every few seconds.** At each decision
+point (an event such as a segment completed, a region entered or discovered,
+"plan ends in N s"; or every 3 s at most) the pilot gets a fresh,
+self-contained observation and makes one decision: `keep`, `fly_plan` (a new or
+extended plan), `hold` or `land`. The drone flies continuously between
+decisions. A plan covers at most 15 s of flight, so the pilot keeps deciding
+from what it currently observes; replacing a plan keeps the drone's momentum.
+Each decision can carry the pilot's own `notes` (its memory) and a `reason`.
+Every turn is one complete training example. Details and settings:
+`docs/tool_api.md`.
 
-| Tool | What it does |
-|---|---|
-| `takeoff(altitude)` | starts the climb; a plan sent now starts when it completes |
-| `fly_plan(segments, mode?)` | commit to `waypoint` / `region` / `orbit` / `survey` / `hold` / `land` segments; `replace` (default) or `append`; returns a preview (length, duration, segment times, regions the path crosses) |
-| `wait(seconds, until?)` | let time pass until the next event, the plan completing, or landing |
-| `hold()` | brake and hover |
-| `land()` | straight home at the current altitude, then land |
-| `check_path(east, north)`, `get_state()` | map and state, no command |
+By default the fake backend runs in **lockstep**: the simulation pauses while
+the model thinks and each decision takes effect 1 s later, so the data does not
+depend on the teacher's latency. `--clock realtime` shows the drone flying
+while the model thinks (demos, videos, AAS).
 
 How fast and hard the drone may fly is the **flight envelope** in
 `config/limits.yaml`: `aggressive` (default; 15 m/s, 7 m/s², 45° tilt, a 150 m

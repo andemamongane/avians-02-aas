@@ -22,7 +22,7 @@ from .runner import MissionRunner, RunCaps, build_system_prompt
 from .safety import Limits, SafetyArbiter, resolve
 from .schema import SCHEMA_VERSION
 from .skills import Skills
-from .tools import PlanToolLayer, ToolLayer
+from .tools import DecisionToolLayer, ToolLayer
 
 REPO = Path(__file__).resolve().parents[2]
 CONFIG = REPO / "config"
@@ -108,6 +108,8 @@ def load_mission(path: str | Path) -> tuple[dict, str, Map | None]:
         raise SystemExit(f"{path}: control must be one of {', '.join(CONTROLS)}")
     try:
         resolve(_load("limits.yaml"), mission.get("envelope"))
+        from .sensing import sensed_map
+        sensed_map(mission, m)
     except ValueError as e:
         raise SystemExit(f"{path}: {e}")
     return mission, prompt, m
@@ -134,6 +136,17 @@ def cmd_fly(args: argparse.Namespace) -> int:
         print("[avians] plan-ahead control is not available on AAS yet (the trajectory "
               "controller is still to be built); use --control step, or --backend fake")
         return 2
+    if mission.get("sensor") and control != "plan":
+        print("[avians] missions with a sensor (hidden regions) need --control plan: the "
+              "step-by-step tools would show the pilot the whole map")
+        return 2
+    # Lockstep (default on the fake backend): the simulation stands still while
+    # the model thinks, and decisions take effect after a fixed latency, so the
+    # data does not depend on how long the teacher happened to think.
+    clock_mode = args.clock or ("lockstep" if args.backend == "fake" else "realtime")
+    if clock_mode == "lockstep" and args.backend != "fake":
+        print("[avians] lockstep needs a simulator avians can pause: use --clock realtime on AAS")
+        return 2
     if args.dry_run:
         from .testing_stub import StubPilot
         steps = mission.get(DRY_RUN_KEY[control])
@@ -141,7 +154,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
             print(f"[avians] {mission['name']} has no {DRY_RUN_KEY[control]} for "
                   f"--control {control}")
             return 2
-        pilot = StubPilot([(s[0], s[1]) for s in steps])
+        pilot = StubPilot([tuple(s) for s in steps])
         pilot_name, model_id = "scripted", "scripted"
     else:
         # Before anything flies: a missing key or SDK must not strand a drone.
@@ -156,15 +169,23 @@ def cmd_fly(args: argparse.Namespace) -> int:
     limits = Limits.from_dict(limits_cfg)
     aas_cfg = _load("aas.yaml")
 
+    from . import clock
+    from .sensing import sensed_map
+    clock.use_lockstep() if clock_mode == "lockstep" else clock.use_realtime()
     backend, ros = _make_backend(args.backend, aas_cfg, limits)
-    # Background threads keep the plan flying and the state sampled while a
-    # model thinks. A scripted dry run has no thinking time (and the tests
-    # drive it with a simulated clock), so it stays on one thread.
-    threaded = args.backend != "fake" or not args.dry_run
+    # In real time, background threads keep the plan flying and the state
+    # sampled while a model thinks. Lockstep has no thinking time to fill, and
+    # neither does a scripted dry run, so they stay on one thread.
+    threaded = clock_mode == "realtime" and (args.backend != "fake" or not args.dry_run)
+    decisions = {**limits_cfg.get("decisions", {}), **(mission.get("decisions") or {})}
+    if clock_mode != "lockstep":
+        decisions["latency_s"] = 0.0                 # real time: the latency is the model's own
+    pilot_map = sensed_map(mission, mission_map)     # the map as the pilot knows it
     episode = _next_episode_dir()
     if mission.get("map"):
         shutil.copy(REPO / mission["map"], episode / "map.yaml")
-    print(f"[avians] episode {episode.name}  backend={args.backend}  control={control}  "
+    print(f"[avians] episode {episode.name}  backend={args.backend}  clock={clock_mode}  "
+          f"control={control}  "
           f"envelope={limits_cfg['envelope']}  "
           f"pilot={pilot_name} ({pilot.provider}: {model_id})"
           + ("  (dry run: scripted, no API calls)" if args.dry_run else ""))
@@ -179,7 +200,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
     sim = (None if args.backend == "fake" else
            SimControl(sim_cfg, episode, args.sim or os.environ.get("AVIANS_SIM_PROFILE")
                       or sim_cfg.get("profile", "local")))
-    started = time.time()
+    started, started_wall = clock.now(), time.time()
     result = None
     monitor = None
     executor = None
@@ -202,11 +223,16 @@ def cmd_fly(args: argparse.Namespace) -> int:
         if control == "plan":
             from .executor import PlanExecutor
             from .trajectory import Envelope
-            executor = PlanExecutor(backend, arbiter, mission_map, Envelope.from_limits(limits),
+            executor = PlanExecutor(backend, arbiter, pilot_map, Envelope.from_limits(limits),
                                     land_timeout=limits_cfg.get("land_timeout_s", 120),
-                                    threaded=threaded)
+                                    threaded=threaded,
+                                    horizon_s=decisions.get("horizon_s", 15.0),
+                                    plan_ending_s=decisions.get("plan_ending_s", 7.0))
             executor.start()
-            tools = PlanToolLayer(executor, mission_map)
+            tools = DecisionToolLayer(executor, pilot_map,
+                                      wake_s=decisions.get("wake_s", 3.0),
+                                      latency_s=decisions.get("latency_s", 0.0),
+                                      history=decisions.get("history", 3))
         else:
             tools = ToolLayer(skills, arbiter, mission_map)
         monitor = _make_monitor(mission, mission_map, backend, limits_cfg, episode,
@@ -220,8 +246,9 @@ def cmd_fly(args: argparse.Namespace) -> int:
                 max_wall_s=mission.get("max_wall_s", 300),
                 max_tokens_total=mission.get("max_tokens_total", 300_000),
             ),
-            system_prompt=build_system_prompt(mission_map, spec_for_agent, control, limits,
-                                              logic=mission.get("logic", "stl")),
+            system_prompt=build_system_prompt(pilot_map, spec_for_agent, control, limits,
+                                              logic=mission.get("logic", "stl"),
+                                              decisions=decisions),
             monitor=monitor,
         )
         if sim is not None:
@@ -244,6 +271,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
         backend.disconnect()
         if ros is not None and ros.ok():
             ros.shutdown()
+        duration = clock.now() - started
+        clock.use_realtime()
 
     meta = {
         "episode": episode.name,
@@ -256,6 +285,9 @@ def cmd_fly(args: argparse.Namespace) -> int:
         "map": mission.get("map"),
         "backend": args.backend,
         "control": control,
+        "clock": clock_mode,
+        "decisions": decisions if control == "plan" else None,
+        "sensor": mission.get("sensor"),
         "envelope": limits_cfg["envelope"],
         "environment": env.summary(),
         "sim": sim.summary() if sim is not None else None,
@@ -264,7 +296,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
         "pilot_label": "Scripted plan" if args.dry_run else pilot_label(pilot_name, pilots_cfg),
         "provider": pilot.provider,
         "model": None if args.dry_run else model_id,
-        "duration_s": round(time.time() - started, 1),
+        "duration_s": round(duration, 1),            # mission time (virtual in lockstep)
+        "wall_s": round(time.time() - started_wall, 1),
         "steps": getattr(result, "steps", 0),
         "terminated_by": getattr(result, "terminated_by", "crashed"),
         "early_stop": monitor.summary() if monitor else None,
@@ -530,7 +563,7 @@ def cmd_compare_controls(args: argparse.Namespace) -> int:
                     continue
                 print(f"\n[compare] flying {name} with {pilot}, {control} control")
                 cmd = [sys.executable, "-m", "avians.cli", "fly", str(path), "--pilot", pilot,
-                       "--control", control, "--backend", args.backend]
+                       "--control", control, "--backend", args.backend, "--clock", "realtime"]
                 if args.dry_run:
                     cmd.append("--dry-run")
                 if subprocess.run(cmd).returncode != 0:
@@ -739,6 +772,9 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--backend", default="aas", choices=["aas", "fake"])
     f.add_argument("--sim", choices=["local", "remote"],
                    help="simulator profile (default: sim.profile in config/aas.yaml)")
+    f.add_argument("--clock", choices=["lockstep", "realtime"],
+                   help="lockstep: the simulation pauses while the model thinks (default on the "
+                        "fake backend, for data); realtime: it does not (demos; AAS)")
     f.add_argument("--control", choices=["plan", "step"],
                    help="plan-ahead (missions default to it) or step-by-step (the baseline)")
     f.add_argument("--dry-run", action="store_true",

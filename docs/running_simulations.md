@@ -127,6 +127,9 @@ avians fly missions/survey_then_land.yaml --control step            # an LLM (Cl
 avians fly missions/survey_then_land.yaml --control step --pilot codex   # another pilot
 ```
 
+- On the fake backend flights run in lockstep (the simulation pauses while the
+  model thinks; decisions take effect 1 s later): the setting for collecting
+  data. Add `--clock realtime` to watch the drone fly while the model thinks.
 - On AAS, use `--control step` for now: plan-ahead flight (the default) needs
   the avians trajectory controller in AAS, which is not written yet.
 - `--dry-run` replaces the LLM with the mission's scripted plan: everything

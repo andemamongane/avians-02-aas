@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import bisect
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .maps import Map
 from .schema import ToolArgError
@@ -96,8 +96,15 @@ class Trajectory:
         return _lerp(self.pos[k - 1], self.pos[k], u), _lerp(self.vel[k - 1], self.vel[k], u)
 
     def remaining_knots(self, t: float) -> list[Knot]:
-        """Knots not reached by time t: what an appended plan continues from."""
-        return [k for k, tk in zip(self.knots, self.knot_times) if tk > t]
+        """What an appended plan continues from: the knots not reached by time
+        t, and a hold in progress with what is left of it."""
+        out = []
+        for k, tk in zip(self.knots, self.knot_times):
+            if tk > t:
+                out.append(k)
+            elif k.dwell and tk + k.dwell > t:          # holding there right now
+                out.append(replace(k, dwell=tk + k.dwell - t))
+        return out
 
 
 # ---------------------------------------------------------------- segments -> knots
@@ -252,7 +259,8 @@ def _crossings(poly, c: float) -> list[float]:
 def build(start: Vec, v0: Vec, knots: list[Knot], env: Envelope) -> Trajectory:
     """Fly from `start` (moving at v0) through the knots."""
     verts: list[Knot] = [Knot(start, env.max_speed)]
-    s0 = _norm(v0)
+    v0 = (v0[0], v0[1], 0.0)          # carry horizontal momentum only: a drone still
+    s0 = _norm(v0)                    # climbing after takeoff should not keep climbing
     if s0 > 0.3:
         # Carry the momentum: the path first continues along the current
         # velocity for as far as it takes to brake (plus the corner's fillet),
@@ -338,7 +346,8 @@ def build(start: Vec, v0: Vec, knots: list[Knot], env: Envelope) -> Trajectory:
     times = [times[i] + sum(d for j, d in stops.items() if j < i) for i in range(n)]
 
     knot_times = [times[i] for i in knot_idx]
-    events = [(tk, k.label) for k, tk in zip(knots, knot_times) if k.label]
+    # an event at a hold says it is done: it fires when the hold ends
+    events = [(tk + (k.dwell or 0.0), k.label) for k, tk in zip(knots, knot_times) if k.label]
     return Trajectory(t_out, p_out, v_out, events=events, knots=list(knots),
                       knot_times=knot_times, lands=bool(knots and knots[-1].land))
 

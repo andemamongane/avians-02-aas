@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 from .backends.base import ActionHandle, VehicleState
 from .schema import ABORTED, ARRIVED, FAILED, TIMEOUT
+from . import clock
 
 
 @dataclass
@@ -145,4 +146,4 @@ class Skills:
 
     def _tick(self) -> None:
         """Let time pass. The ROS backend is spun by its own thread."""
-        time.sleep(self.poll_dt)
+        clock.sleep(self.poll_dt)

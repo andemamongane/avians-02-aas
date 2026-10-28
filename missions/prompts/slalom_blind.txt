@@ -1,0 +1,6 @@
+Get from the pad into the finish box, 120 m north, and stay inside it for 2
+seconds, within 60 seconds of the start. Walls stand somewhere between the pad
+and the finish, but you do not know where, or where their gaps are: the drone's
+sensor reveals a wall once it is within 35 m of it. Never touch a wall. Stay at
+or below 20 metres. Then fly back to the pad and land within 90 seconds of
+leaving the finish.

@@ -76,6 +76,8 @@ class FlightData:
     # and the early stop, if it ended the mission (see _monitor_stop)
     online: list[dict[str, Any]] = field(default_factory=list)
     stop: dict[str, Any] | None = None
+    # plan-ahead decisions: how the pilot decided (see decision_metrics)
+    decisions: dict[str, Any] | None = None
 
     @property
     def dense(self) -> bool:
@@ -122,7 +124,51 @@ def load_episode(episode_dir: Path) -> FlightData:
         stl=json.loads((d / "stl.json").read_text()) if (d / "stl.json").exists() else None,
         online=load_jsonl(d / "stl_online.jsonl") if (d / "stl_online.jsonl").exists() else [],
         stop=_monitor_stop(records, t0),
+        decisions=decision_metrics(records, meta),
     )
+
+
+def decision_metrics(records: list[dict], meta: dict) -> dict | None:
+    """How a plan-ahead pilot decided: how often, how often it changed its
+    plan, and whether changes followed something it had just observed.
+    A pilot that plans once and coasts scores few changes; one that dithers
+    scores many changes with no event behind them."""
+    if not meta.get("decisions"):
+        return None
+    decisions, changes, after_event, rejected = 0, 0, 0, 0
+    keeps = 0
+    seen_events = False                 # did the observation the pilot decided on report events?
+    started = False
+    for r in records:
+        if r["kind"] == "action" and r["tool"] in ("takeoff", "fly_plan", "keep", "hold", "land"):
+            decisions += 1
+            tool = r["tool"]
+            if tool == "keep":
+                keeps += 1
+            elif tool != "takeoff":
+                if started:              # the first plan is not a change of mind
+                    changes += 1
+                    after_event += seen_events
+                started = True
+        elif r["kind"] == "observation":
+            o = r["observation"]
+            rejected += o["status"] in ("rejected", "blocked")
+            seen_events = bool(o.get("events"))
+    t_end = max((r["t_wall"] for r in records), default=0.0)
+    t0 = next((r["t_wall"] for r in records if r["kind"] == "mission"), t_end)
+    minutes = max((t_end - t0) / 60.0, 1e-9)
+    return {
+        "decisions": decisions,
+        "per_minute": round(decisions / minutes, 1),
+        "keep_share": round(keeps / decisions, 2) if decisions else 0.0,
+        "plan_changes": changes,
+        "changes_after_an_event": round(after_event / changes, 2) if changes else None,
+        "rejected": rejected,
+        "horizon_s": meta["decisions"].get("horizon_s"),
+        "wake_s": meta["decisions"].get("wake_s"),
+        "latency_s": meta["decisions"].get("latency_s"),
+        "clock": meta.get("clock"),
+    }
 
 
 def _monitor_stop(records: list[dict], t0: float) -> dict | None:
@@ -370,8 +416,9 @@ def compute_metrics(f: FlightData) -> dict[str, Any]:
 
     usage = f.meta.get("usage", {})
     checks = {
-        "ended by the model or the STL monitor (not a cap)": f.meta.get("terminated_by") in (
-            "model_stop", "stl_violated", "stl_satisfied"),
+        "ended by the model, the landing or the STL monitor (not a cap)":
+            f.meta.get("terminated_by") in ("model_stop", "landed", "stl_violated",
+                                            "stl_satisfied"),
         "landed": landed,
         "no failed or timed-out actions": not any(
             c.status in ("failed", "timeout") for c in flight_calls),
@@ -401,6 +448,7 @@ def compute_metrics(f: FlightData) -> dict[str, Any]:
         "tokens": {"input": usage.get("input_tokens", 0),
                    "output": usage.get("output_tokens", 0)},
         "flow": flow_metrics(f),
+        "decisions": f.decisions,
         "stl": f.stl,
         "online": {"policy": (f.meta.get("early_stop") or {}).get("policy"),
                    "stop": f.stop, "decided_at": decided_at(f.online)} if f.online else None,

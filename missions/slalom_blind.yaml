@@ -1,0 +1,43 @@
+# The slalom without the map: the walls are hidden until the drone's sensor
+# (35 m) reaches them, so the gaps are learned during the flight and the
+# route has to be decided from what the pilot observes as it goes. A stand-in
+# for camera and lidar; the score uses the full map.
+name: slalom_blind
+prompt_file: slalom_blind.txt
+map: maps/course_01.yaml
+envelope: aggressive
+control: plan
+sensor:
+  range_m: 35
+  hidden: [wall_1, wall_2, wall_3]
+spec: >-
+  G[0,240] (!in(wall_1) & !in(wall_2) & !in(wall_3) & alt <= 20)
+  & F[0,60] (G[0,2] in(finish) & F[0,90] (in(home_pad) & alt <= 1))
+show_spec: true
+max_steps: 20
+max_wall_s: 300
+description: The slalom with the walls hidden until the 35 m sensor finds them.
+
+# Scripted decisions (the stub knows the course; a real pilot does not): it
+# probes forward until the next wall is discovered, then commits the leg round it.
+dry_run_plan:
+  - [takeoff, {altitude: 8}]
+  - [fly_plan, {segments: [{type: waypoint, east: 40, north: 32, altitude: 8},
+                           {type: waypoint, east: 28, north: 46, altitude: 8}]}]
+  - [fly_plan, {segments: [{type: waypoint, east: 40, north: 40, altitude: 8},
+                           {type: waypoint, east: -40, north: 62, altitude: 8}]},
+     {when: "discovered wall_2"}]
+  - [fly_plan, {segments: [{type: waypoint, east: -12, north: 76, altitude: 8}], mode: append},
+     {when: "plan ends in"}]
+  - [fly_plan, {segments: [{type: waypoint, east: 40, north: 92, altitude: 8}]},
+     {when: "discovered wall_3"}]
+  - [fly_plan, {segments: [{type: region, region: finish, altitude: 8}], mode: append},
+     {when: "plan ends in"}]
+  - [fly_plan, {segments: [{type: hold, duration: 3}], mode: append}, {when: "entered finish"}]
+  - [fly_plan, {segments: [{type: waypoint, east: 40, north: 92, altitude: 8}], mode: append},
+     {when: "held 3 s"}]
+  - [fly_plan, {segments: [{type: waypoint, east: -40, north: 62, altitude: 8}], mode: append},
+     {when: "plan ends in"}]
+  - [fly_plan, {segments: [{type: waypoint, east: 40, north: 32, altitude: 8}], mode: append},
+     {when: "plan ends in"}]
+  - [fly_plan, {segments: [{type: land}], mode: append}, {when: "plan ends in"}]

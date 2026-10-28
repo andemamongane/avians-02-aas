@@ -29,6 +29,7 @@ import threading
 import time
 
 from .base import ActionHandle, VehicleState
+from .. import clock
 
 ORBIT_SPEED = 5.0           # AAS's mc_orbit_speed_ms default
 TAKEOFF_DONE_RATIO = 0.9    # AAS's mc_takeoff_completed_ratio default
@@ -49,7 +50,7 @@ class FakeBackend:
                  climb: float | None = None, descent: float | None = None):
         # Look time.monotonic up at call time (not as a default argument), so a
         # patched clock in tests reaches backends that the CLI creates.
-        self._time = time_fn or (lambda: time.monotonic())
+        self._time = time_fn or (lambda: clock.monotonic())
         self._t0 = self._time()
         self.state = VehicleState(mode="disarmed")
         self.cruise = speed

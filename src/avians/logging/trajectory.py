@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ..schema import SCHEMA_VERSION
+from .. import clock
 
 
 class TrajectoryLogger:
@@ -30,7 +31,7 @@ class TrajectoryLogger:
         record = {
             "seq": self._seq,
             "kind": kind,
-            "t_wall": time.time(),
+            "t_wall": clock.now(),
             "schema_version": SCHEMA_VERSION,
             **payload,
         }
@@ -47,8 +48,9 @@ class TrajectoryLogger:
     def request(self, messages: list[dict], model: str) -> None:
         self._write("request", model=model, messages=messages)
 
-    def response(self, content: list[dict], stop_reason: str | None, usage: dict) -> None:
-        self._write("response", content=content, stop_reason=stop_reason, usage=usage)
+    def response(self, content: list[dict], stop_reason: str | None, usage: dict,
+                 **extra: Any) -> None:
+        self._write("response", content=content, stop_reason=stop_reason, usage=usage, **extra)
 
     def tool_call(self, name: str, args: dict, tool_use_id: str) -> None:
         self._write("action", tool=name, args=args, tool_use_id=tool_use_id)

@@ -25,12 +25,12 @@ dry_run_script:
   - [reposition, {east: 0, north: 20, altitude: 5}]
   - [land, {}]
 
-# The same route as one plan, flown through without stopping except to survey.
+# Scripted decisions on a receding horizon: each part of the route is committed
+# when an event says the drone is ready for it (the stub keeps until then).
 dry_run_plan:
   - [takeoff, {altitude: 5}]
   - [fly_plan, {segments: [{type: waypoint, east: 0, north: 16, altitude: 5},
-                           {type: region, region: survey_a, altitude: 5},
-                           {type: hold, duration: 11},
-                           {type: waypoint, east: 0, north: 20, altitude: 5},
-                           {type: land}]}]
-  - [wait, {seconds: 180, until: landed}]
+                           {type: region, region: survey_a, altitude: 5}]}]
+  - [fly_plan, {segments: [{type: hold, duration: 11}], mode: append}, {when: "reached survey_a"}]
+  - [fly_plan, {segments: [{type: waypoint, east: 0, north: 20, altitude: 5}, {type: land}],
+                mode: append}, {when: "held 11 s"}]

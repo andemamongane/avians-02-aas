@@ -18,6 +18,7 @@ from typing import Any
 from .maps import Map
 from .schema import TOOL_SPECS
 from .tools import ToolLayer
+from . import clock
 
 BASE_PROMPT = """You are piloting a quadrotor drone through a small set of tools that command its autopilot.
 
@@ -56,48 +57,64 @@ SFO_GUIDE = """The requirements also use first-order quantifiers (signal first-o
   t2 - t1 <= 30             moments compared directly"""
 
 
-PLAN_PROMPT = """You are piloting a quadrotor drone by planning its flight. You command it with
-flight plans, not single moves.
+PLAN_PROMPT = """You are piloting a quadrotor drone. You fly it by making a decision every few
+seconds, each from what you observe at that moment.
 
 Frame and units: positions are metres relative to the launch point: east, north,
 and altitude ABOVE the launch point (always positive). Times are seconds from the
-start of the mission; every tool result reports the mission time.
-There is no camera and no obstacle sensing: you know your own state and the map.
+start of the mission.
 
 How control works:
-- The drone flies your current plan continuously while you think. Every tool
-  returns at once; what happened since your last call (segments completed,
-  regions entered or left, the plan completing, landing) arrives as events.
-- Think ahead. Send the whole route in one fly_plan. Waypoints are flown
-  THROUGH, not stopped at: the planner rounds the corners and slows only where
-  a turn demands it. Stop (hold) only where the mission needs the drone to be
-  stationary.
+- At each decision point you get a fresh observation: the drone's state, what
+  happened since your last decision (events), the rest of your plan, the time
+  spent in each region, the map as you know it, your own notes, and your last
+  few decisions. You then make ONE decision: keep (fly on unchanged), fly_plan
+  (a new or extended plan), hold, or land.
+- The drone flies continuously between decisions. You decide again at the next
+  event or within {wake:g} s, whichever comes first. Events include segments
+  completed, regions entered or left, regions discovered, and "plan ends in N s".
+- Plan a receding horizon. A plan may cover at most {horizon:g} s of flight:
+  commit to the next part of the route, then extend or change it as you learn
+  more (fly_plan with mode "append" to extend; the default "replace" starts a
+  new plan from where the drone is, keeping its momentum). Before your plan runs
+  out, extend it; if it runs out, the drone stops and holds.
+- Decide from the current observation. Keep the plan when nothing calls for a
+  change; change it when something you observe does. Do not change it for no
+  reason.
+- Waypoints are flown THROUGH, not stopped at: corners are rounded, cutting up
+  to {corner:g} m inside the waypoint. Stop (hold) only where the mission needs
+  the drone to be stationary.
 - Fly decisively. The flight envelope allows up to {speed:g} m/s and
   {accel:g} m/s^2 of acceleration; the planner uses all of it unless you cap a
   leg's speed. Fast, smooth, efficient flight is the goal.
-- To change course, send a new fly_plan: it replaces the old one from wherever
-  the drone is, keeping its momentum. To extend a plan, use mode "append".
-- While a plan runs, use wait to let time pass until the next event instead of
-  polling get_state.
-- Call takeoff first; you can send fly_plan right away. End the mission with a
-  plan whose last segment is land, routed by you around regions you must avoid,
-  then wait until the drone has landed, then stop.
+- Use notes for what you want to remember across decisions (what you have seen,
+  what you intend); they replace your previous notes. Give a one-sentence reason
+  with each decision.
+- The map may be incomplete: some regions may only be discovered when the drone
+  comes near them.
+- Start with takeoff. End the mission by landing at the launch point (a plan
+  ending with a land segment routed around regions you must avoid, or land).
+  The mission is over when the drone has landed.
 - The safety system enforces only a {geofence:g} m geofence around the launch
   point, an altitude band of {floor:g}-{ceiling:g} m and the flight envelope. It
   does NOT know about the map regions: respecting them is your responsibility."""
 
 
 def build_system_prompt(mission_map: Map | None, spec: str | None, control: str = "step",
-                        limits=None, logic: str = "stl") -> str:
+                        limits=None, logic: str = "stl", decisions: dict | None = None) -> str:
+    """The pilot's standing instructions. Under plan-ahead control the map is
+    not here: it is in every decision's prompt, as the pilot knows it then."""
     if control == "plan":
         from .safety import Limits
         L = limits or Limits()
+        d = decisions or {}
         parts = [PLAN_PROMPT.format(speed=L.max_speed_ms, accel=L.max_accel_ms2,
-                                    geofence=L.geofence_radius_m, floor=L.min_altitude_m,
-                                    ceiling=L.max_altitude_m)]
+                                    corner=L.corner_radius_m, geofence=L.geofence_radius_m,
+                                    floor=L.min_altitude_m, ceiling=L.max_altitude_m,
+                                    wake=d.get("wake_s", 3.0), horizon=d.get("horizon_s", 15.0))]
     else:
         parts = [BASE_PROMPT]
-    if mission_map is not None and mission_map.regions:
+    if control != "plan" and mission_map is not None and mission_map.regions:
         parts.append("Mission map. Region vertices are (east, north) in metres:\n"
                      + mission_map.describe())
     if spec:
@@ -148,7 +165,10 @@ class MissionRunner:
             self.monitor.start()
             self.tools.set_interrupt(self.monitor.poll)
         try:
-            self._loop(result, mission_prompt)
+            if getattr(self.tools, "decisions", False):
+                self._decision_loop(result, mission_prompt)
+            else:
+                self._loop(result, mission_prompt)
             if not (self.monitor and self.monitor.terminated_by):
                 self._finish_plan(result)
         finally:
@@ -193,16 +213,93 @@ class MissionRunner:
                       report=self.monitor.last, state=_state(st))
         if not st.armed:
             return
-        t0 = time.time()
+        t0 = clock.now()
         status, reason, final = self.tools.emergency_land()
         self.log.note("monitor landed the drone", status=status, reason=reason,
-                      elapsed_s=round(time.time() - t0, 1), state=_state(final))
+                      elapsed_s=round(clock.now() - t0, 1), state=_state(final))
+
+    def _capped(self, result: RunResult, t0: float, max_steps: int) -> bool:
+        if result.steps >= max_steps:
+            result.terminated_by = "step_cap"
+        elif clock.now() - t0 > self.caps.max_wall_s:
+            result.terminated_by = "wall_clock_cap"
+        elif result.usage["input_tokens"] + result.usage["output_tokens"] > self.caps.max_tokens_total:
+            result.terminated_by = "token_cap"
+        else:
+            return False
+        return True
+
+    def _ask(self, result: RunResult, messages: list) -> Any:
+        """One model call, logged with its real latency. None on API errors."""
+        self.log.request(messages, self.model)
+        t_real = time.perf_counter()
+        try:
+            reply = self.pilot.step()
+        except Exception as e:                      # network/rate-limit/overload/bad request
+            result.terminated_by = "api_error"
+            result.error = f"{type(e).__name__}: {e}"
+            self.log.note("api error", error=result.error)
+            return None
+        result.usage["input_tokens"] += reply.usage["input_tokens"]
+        result.usage["output_tokens"] += reply.usage["output_tokens"]
+        self.log.response(reply.content, reply.stop_reason, reply.usage,
+                          latency_s=round(time.perf_counter() - t_real, 3))
+        return reply
+
+    def _decision_loop(self, result: RunResult, mission_prompt: str) -> None:
+        """Plan-ahead control: one self-contained prompt and one decision per
+        turn (tools.DecisionToolLayer). Each request in the log is a complete
+        training example: no conversation history beyond what the prompt holds.
+        A reply without a decision counts as keep. The mission ends when the
+        drone has landed."""
+        t0 = clock.now()
+        max_steps = max(self.caps.max_steps, int(self.caps.max_wall_s / self.tools.wake_s) + 20)
+        while not self._stopped(result) and not self._capped(result, t0, max_steps):
+            if self.tools.mission_over():
+                result.terminated_by = "landed"
+                break
+            prompt = self.tools.decision_prompt(mission_prompt, clock.lockstep())
+            self.pilot.start(self.system_prompt, self._specs(), prompt)
+            messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+            decided = False
+            for _ in range(4):                      # free check_path lookups, then a decision
+                reply = self._ask(result, messages)
+                if reply is None:
+                    return
+                messages.append({"role": "assistant", "content": reply.content})
+                uses = reply.tool_uses
+                if not uses:
+                    break
+                outputs = []
+                for block in uses:                  # lookups, then the first decision
+                    name, args, uid = block["name"], block.get("input", {}), block["id"]
+                    self.log.tool_call(name, args, uid)
+                    if decided:
+                        obs = None
+                        text = "not done: one decision per turn; decide again next turn"
+                        self.log.note("extra call ignored", tool=name, tool_use_id=uid)
+                    else:
+                        obs = self.tools.dispatch(name, args)
+                        text = obs.to_text()
+                        self.log.observation(obs.to_dict(), text, uid)
+                        result.steps += 1
+                        decided = name != "check_path"
+                    outputs.append((uid, text))
+                if decided:
+                    break
+                self.pilot.add_tool_results(outputs)
+                messages.append({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": uid, "content": text}
+                    for uid, text in outputs]})
+            if not decided:                         # no decision this turn: keep flying
+                obs = self.tools.dispatch("keep", {})
+                self.log.note("no decision this turn: kept the plan", observation=obs.to_dict())
 
     def _loop(self, result: RunResult, mission_prompt: str) -> None:
         self.pilot.start(self.system_prompt, self._specs(), mission_prompt)
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": mission_prompt}]
-        t0 = time.time()
+        t0 = clock.now()
 
         while True:
             if self._stopped(result):
@@ -210,7 +307,7 @@ class MissionRunner:
             if result.steps >= self.caps.max_steps:
                 result.terminated_by = "step_cap"
                 break
-            if time.time() - t0 > self.caps.max_wall_s:
+            if clock.now() - t0 > self.caps.max_wall_s:
                 result.terminated_by = "wall_clock_cap"
                 break
             total_tokens = result.usage["input_tokens"] + result.usage["output_tokens"]

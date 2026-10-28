@@ -65,6 +65,16 @@ def _summary_md(f, m: dict, headline: str) -> str:
                   f"- Hovering {flow['hover_fraction'] * 100:.0f}% of {flow['airborne_s']} s "
                   f"airborne; mean airborne speed {flow['mean_airborne_speed_ms']} m/s; "
                   f"{flow['mid_air_stops']} mid-air stops"]
+    dec = m.get("decisions")
+    if dec:
+        after = (f"; {dec['changes_after_an_event'] * 100:.0f}% of them right after an event"
+                 if dec["changes_after_an_event"] is not None else "")
+        lines += ["", "## Decisions", "",
+                  f"- {dec['decisions']} decisions ({dec['per_minute']} per minute), "
+                  f"{dec['keep_share'] * 100:.0f}% keep; {dec['plan_changes']} plan changes"
+                  f"{after}; {dec['rejected']} rejected",
+                  f"- horizon {dec['horizon_s']} s, wake-up {dec['wake_s']} s, "
+                  f"latency {dec['latency_s']} s, clock {dec['clock']}"]
     online = m.get("online")
     if online:
         stop = online["stop"]

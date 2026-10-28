@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # --- status codes ----------------------------------------------------------
 # Failures are OBSERVATIONS, never exceptions: the model must be able to see a
@@ -376,8 +376,55 @@ PLAN_TOOL_SPECS: list[dict[str, Any]] = [
     },
     next(t for t in TOOL_SPECS if t["name"] == "check_path"),
 ]
+# --- decision tools: plan-ahead as a sequence of decisions -----------------------
+# Receding horizon. At every decision point (an event, or wake_s at most) the
+# pilot sees a fresh, self-contained observation and makes ONE decision: keep
+# the plan, change it, hold, or land. The drone then flies on until the next
+# decision point. Plans cover at most the horizon, so the pilot keeps deciding.
+_NOTES = {"type": "string", "description": (
+    "Your notes to yourself (a few sentences): what you know and what you intend. They "
+    "are shown back to you at every decision and replace your previous notes; leave out "
+    "to keep them unchanged.")}
+_WHY = {"type": "string", "description": "One sentence: why this decision, given what you observe now."}
+
+
+def _decision(name: str, description: str, props: dict | None = None,
+              required: list | None = None) -> dict:
+    return {"name": name, "description": description,
+            "input_schema": {"type": "object",
+                             "properties": {**(props or {}), "notes": _NOTES, "reason": _WHY},
+                             "required": required or []}}
+
+
+DECISION_TOOL_SPECS: list[dict[str, Any]] = [
+    _decision("takeoff", (
+        "Arm and climb vertically to the given altitude above the launch point. Ends your "
+        "turn; you decide again when the climb completes. Your first plan can follow then."),
+        {"altitude": _ALT}, ["altitude"]),
+    _decision("fly_plan", (
+        "Commit to the next part of the flight: an ordered list of segments the drone flies "
+        "continuously, rounding corners and slowing only where turns require it. A plan may "
+        "cover at most the planning horizon of flight; extend it as you go. mode 'replace' "
+        "(default) starts this plan from where the drone is, keeping its momentum; 'append' "
+        "adds these segments after the rest of the current plan. Ends your turn."),
+        {"segments": next(t for t in PLAN_TOOL_SPECS if t["name"] == "fly_plan")
+         ["input_schema"]["properties"]["segments"],
+         "mode": {"type": "string", "enum": ["replace", "append"]}}, ["segments"]),
+    _decision("keep", (
+        "Keep flying the current plan unchanged (or keep holding, or keep landing). Choose "
+        "this when nothing you observe calls for a change. Ends your turn.")),
+    _decision("hold", (
+        "Abandon the plan: brake along the current direction and hover where the drone "
+        "stops. Ends your turn.")),
+    _decision("land", (
+        "Abandon the plan, fly straight to the launch point at the current altitude and "
+        "land. If that straight line must avoid a region, plan the route home with "
+        "fly_plan instead, ending with a land segment. Ends your turn.")),
+    next(t for t in TOOL_SPECS if t["name"] == "check_path"),
+]
+DECISIONS = ("takeoff", "fly_plan", "keep", "hold", "land")
 FLIGHT_TOOLS = ("takeoff", "reposition", "goto_region", "orbit", "hover", "land",
-                "fly_plan", "hold", "wait")
+                "fly_plan", "hold", "wait", "keep")
 
 
 def validate_tool_args(name: str, args: dict[str, Any],

@@ -39,6 +39,15 @@ max_hover_s: 60.0
 max_orbit_s: 120.0
 max_plan_s: 600.0          # longest single flight plan
 
+# plan-ahead control: one decision per turn, on a receding horizon (a mission
+# can override any of these with its own `decisions:` block)
+decisions:
+  horizon_s: 15.0          # a plan covers at most this much flight
+  wake_s: 3.0              # the pilot decides again at the next event, or within this
+  plan_ending_s: 7.0       # the "plan ends in N s" event: at least wake_s + latency_s + a margin
+  latency_s: 1.0           # lockstep only: a decision takes effect this long after its observation
+  history: 3               # the pilot sees its last N decisions
+
 # skill-layer behaviour (step-by-step tools)
 arrive_radius_m: 1.0       # PX4 reposition settles within ~0.5 m in calm air; wind needs slack
 action_timeout_s: 60

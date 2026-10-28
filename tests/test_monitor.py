@@ -27,8 +27,7 @@ SURVEY_SPEC = ("G[0,240] !in(nofly_1) "
 THROUGH_NOFLY_PLAN = [("takeoff", {"altitude": 5}),
                       ("fly_plan", {"segments": [
                           {"type": "waypoint", "east": 15, "north": 25, "altitude": 5},
-                          {"type": "hold", "duration": 12}, {"type": "land"}]}),
-                      ("wait", {"seconds": 120, "until": "landed"})]
+                          {"type": "hold", "duration": 5}]})]
 THROUGH_NOFLY = [("takeoff", {"altitude": 5}),
                  ("reposition", {"east": 15, "north": 25, "altitude": 5}),
                  ("hover", {"duration": 12}),

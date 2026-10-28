@@ -17,10 +17,10 @@ description: Survey every field in any order, keep height over field A, avoid no
 
 dry_run_plan:
   - [takeoff, {altitude: 6}]
-  - [fly_plan, {segments: [{type: region, region: survey_b, altitude: 6},
-                           {type: hold, duration: 6},
-                           {type: region, region: survey_a, altitude: 6},
-                           {type: hold, duration: 6},
-                           {type: waypoint, east: 0, north: 20, altitude: 6},
-                           {type: land}]}]
-  - [wait, {seconds: 200, until: landed}]
+  - [fly_plan, {segments: [{type: region, region: survey_b, altitude: 6}]}]
+  - [fly_plan, {segments: [{type: hold, duration: 6}], mode: append}, {when: "entered survey_b"}]
+  - [fly_plan, {segments: [{type: region, region: survey_a, altitude: 6}], mode: append},
+     {when: "held 6 s"}]
+  - [fly_plan, {segments: [{type: hold, duration: 6}], mode: append}, {when: "entered survey_a"}]
+  - [fly_plan, {segments: [{type: waypoint, east: 0, north: 20, altitude: 6}, {type: land}],
+                mode: append}, {when: "held 6 s"}]

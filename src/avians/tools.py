@@ -6,6 +6,7 @@ of dispatch(): an exception the model cannot see is a lost recovery example.
 """
 from __future__ import annotations
 
+import math
 import time
 import traceback
 
@@ -13,10 +14,12 @@ from .backends.base import VehicleState
 from .maps import Map
 from .safety import SafetyArbiter
 from .schema import (
-    BLOCKED, FAILED, OK, PLAN_TOOL_SPECS, REJECTED, TOOL_SPECS,
+    BLOCKED, DECISION_TOOL_SPECS, FAILED, OK, PLAN_TOOL_SPECS, REJECTED, TOOL_SPECS,
     Observation, ToolArgError, validate_tool_args,
 )
 from .skills import ActionOutcome, Skills
+from .trajectory import ALONG
+from . import clock
 
 
 class ToolLayer:
@@ -151,7 +154,7 @@ class ToolLayer:
             heading_deg=st.heading_deg, mode=st.mode, armed=st.armed,
             battery_pct=st.battery_pct,
             mission_elapsed_s=self.backend.now() - self.t_start,
-            t_sim=st.t_sim, t_wall=time.time(),
+            t_sim=st.t_sim, t_wall=clock.now(),
         )
         if self.map is not None and self.map.regions:
             obs.inside = self.map.inside(st.east, st.north, st.alt)
@@ -229,6 +232,110 @@ class PlanToolLayer(ToolLayer):
         if started is not None:                  # for plots; never sent to the model
             obs.plan_path, obs.plan_age_s = _path_for_plots(started[0]), round(started[1], 3)
         return obs
+
+
+class DecisionToolLayer(PlanToolLayer):
+    """Plan-ahead control as a sequence of decisions (receding horizon).
+
+    One call is one decision. In lockstep the decision takes effect after a
+    fixed latency (the simulation stands still while the model thinks, then
+    flies latency_s on the old plan); then the drone flies on until the next
+    decision point: an event (segment done, region entered or left, region
+    discovered, plan ending...) or wake_s at most. The result is what happened
+    meanwhile. check_path is free: it answers at once and uses no turn.
+
+    Each turn the pilot gets a self-contained prompt (decision_prompt): the
+    current state, the events since its last decision, the rest of its plan,
+    time spent in each region, the map as it knows it, its own notes, and its
+    last few decisions. Every turn is then one complete training example.
+    """
+    specs = DECISION_TOOL_SPECS
+    decisions = True
+
+    def __init__(self, executor, mission_map: Map | None = None, wake_s: float = 3.0,
+                 latency_s: float = 0.0, history: int = 3):
+        super().__init__(executor, mission_map)
+        self.wake_s, self.latency_s, self.history_n = wake_s, latency_s, history
+        self.notes = ""
+        self.history: list[str] = []
+        self.last: Observation | None = None
+
+    def dispatch(self, name: str, args: dict) -> Observation:
+        self.call_count += 1
+        try:
+            clean = validate_tool_args(name, args, DECISION_TOOL_SPECS)
+        except ToolArgError as e:
+            return self._remember(name, {}, self._plan_obs(REJECTED, str(e)))
+        if clean.get("notes") is not None:
+            self.notes = clean["notes"][:800]
+        if name == "check_path":                      # free: no time passes
+            obs = self._check_path(clean["east"], clean["north"])
+            return self._plan_obs(obs.status, obs.reason, obs.info)
+        ex = self.ex
+        n0 = len(ex.events)                           # events from here on wake the pilot,
+        try:                                          # including any during the latency
+            if self.latency_s > 0 and ex.phase not in ("ground", "landed"):
+                ex.wait(self.latency_s, "time")       # the decision lands after the latency
+            if name == "takeoff":
+                result = ex.takeoff(clean["altitude"])
+            elif name == "fly_plan":
+                result = ex.fly_plan(clean["segments"], clean.get("mode", "replace"))
+            elif name == "hold":
+                result = ex.hold()
+            elif name == "land":
+                result = ex.land()
+            else:                                     # keep
+                result = (OK, f"keeping: {ex.plan_report()}", "")
+            if ex.phase not in ("ground", "landed") and len(ex.events) == n0:
+                ex.wait(self.wake_s, "event", since=n0)   # fly on to the next decision point
+        except Exception as e:                        # never let it escape
+            traceback.print_exc()
+            result = (FAILED, f"{type(e).__name__}: {e}", "")
+        return self._remember(name, clean, self._plan_obs(*result))
+
+    def _remember(self, name: str, args: dict, obs: Observation) -> Observation:
+        what = name
+        if name == "fly_plan":
+            what += f" ({args.get('mode', 'replace')}, {len(args.get('segments', []))} segments)"
+        why = f" ({obs.reason})" if obs.status not in ("ok",) and obs.reason else ""
+        self.history = (self.history + [f"t={obs.mission_elapsed_s:.1f} s {what}: "
+                                        f"{obs.status}{why}"])[-self.history_n:]
+        self.last = obs
+        return obs
+
+    def mission_over(self) -> bool:
+        return self.ex.phase == "landed"
+
+    def decision_prompt(self, mission_prompt: str, lockstep: bool) -> str:
+        """The self-contained prompt for the next decision."""
+        last = self.last or self._plan_obs(OK, "")
+        timing = (f"The simulation is paused while you decide; your decision takes effect "
+                  f"{self.latency_s:g} s after this observation." if lockstep else
+                  "The drone keeps flying while you decide.")
+        progress = self.ex.progress_report()
+        known = self.map.describe() if self.map is not None and self.map.regions else "(none)"
+        discovered = getattr(self.map, "discovered", {})
+        st = self.backend.get_state()
+        speed = math.hypot(st.v_east, st.v_north)
+        brake = speed * speed / (2 * ALONG * self.ex.env.max_accel) + speed * self.latency_s
+        stopping = (f" At {speed:.1f} m/s the drone needs about {brake:.0f} m to stop, counting "
+                    f"from now." if speed > 0.5 else "")
+        parts = [
+            f"MISSION\n{mission_prompt}",
+            f"NOW: mission time {self.ex.mission_time():.1f} s. {timing} You will decide again "
+            f"at the next event, or within {self.wake_s:g} s.{stopping}",
+            f"LAST RESULT AND CURRENT STATE\n{last.to_text()}",
+            f"PLAN\n{self.ex.plan_report()}",
+            "TIME IN REGIONS SO FAR\n" + ("\n".join(progress) if progress else "(none yet)"),
+            "MAP AS YOU KNOW IT (vertices are east, north in metres)\n" + known
+            + ("\nDiscovered during this flight: " + ", ".join(
+                f"{rid} at t={t:.1f} s" for rid, t in discovered.items()) if discovered else ""),
+            f"YOUR NOTES\n{self.notes or '(none yet)'}",
+            "YOUR LAST DECISIONS\n" + ("\n".join(self.history) if self.history else "(none yet)"),
+            "Decide now: keep, fly_plan, hold or land (or takeoff, first). check_path is "
+            "free and does not use up your turn.",
+        ]
+        return "\n\n".join(parts)
 
 
 def _path_for_plots(traj, spacing: float = 2.0) -> list[list[float]]:
