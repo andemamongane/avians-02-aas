@@ -31,6 +31,8 @@ the physics differs. The remote side is written but not yet run (see the end).
 
 ## Quick start (local)
 
+Step-by-step instructions for both setups, including the Linux GPU machine without sudo or a display: [docs/running_simulations.md](docs/running_simulations.md).
+
 Clone with the submodule:
 
 ```bash
