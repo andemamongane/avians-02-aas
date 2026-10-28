@@ -301,6 +301,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
         "steps": getattr(result, "steps", 0),
         "terminated_by": getattr(result, "terminated_by", "crashed"),
         "early_stop": monitor.summary() if monitor else None,
+        # the host slept mid-flight (real time): the flight is not usable
+        "host_suspended_s": monitor.suspended_s() if monitor else None,
         "usage": getattr(result, "usage", {}),
         "error": getattr(result, "error", None),
         "versions": _versions(),
@@ -308,6 +310,9 @@ def cmd_fly(args: argparse.Namespace) -> int:
         "frame_origin_ned": getattr(backend, "frame_origin_ned", None),
     }
     (episode / "meta.json").write_text(json.dumps(meta, indent=2))
+    if meta["host_suspended_s"]:
+        print(f"[warn] the host was suspended for {meta['host_suspended_s']} s mid-flight "
+              f"(laptop asleep?): this flight is not usable; keep the machine awake and fly again")
     convert_episode(episode)
 
     problems = validate_episode(episode)
@@ -541,7 +546,8 @@ def _find_flight(mission: str, pilot: str, control: str, backend: str,
         if (meta.get("mission") == mission and meta.get("control") == control
                 and meta.get("backend") == backend and bool(meta.get("dry_run")) == dry_run
                 and (dry_run or meta.get("pilot") == pilot)
-                and meta.get("terminated_by") != "crashed"):
+                and meta.get("terminated_by") != "crashed"
+                and not meta.get("host_suspended_s")):
             found = d
     return found
 

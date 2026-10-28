@@ -61,6 +61,10 @@ class OnlineMonitor:
         self._t0: float | None = None
         self._last_eval = -float("inf")
         self._eval_cost = 0.0                     # wall seconds the last evaluation took
+        # Largest gap between samples. In real time with a background thread a
+        # gap of seconds means the whole process stood still (the host slept):
+        # the flight is not what a drone would have done, so it is flagged.
+        self.max_gap_s = 0.0
         self._lock = threading.Lock()
         self._log = log_path.open("a", encoding="utf-8") if log_path else None
         # every sample, for plots and scoring when there is no rosbag (fake backend)
@@ -115,6 +119,8 @@ class OnlineMonitor:
             tr = self.trace
             if tr.t and t <= tr.t[-1]:
                 return
+            if tr.t:
+                self.max_gap_s = max(self.max_gap_s, t - tr.t[-1])
             tr.t.append(t), tr.east.append(st.east), tr.north.append(st.north)
             tr.alt.append(st.alt), tr.speed.append(st.speed)
             if self._state is not None:
@@ -150,6 +156,13 @@ class OnlineMonitor:
     def _stop(self, terminated_by: str, reason: str) -> None:
         self.terminated_by = terminated_by
         self.stop_reason = "mission ended by the monitor: " + reason
+
+    def suspended_s(self) -> float | None:
+        """Seconds the flight stood still because the host was suspended
+        (real time, background sampling only), or None."""
+        if self.threaded and self.max_gap_s > 2.0:
+            return round(self.max_gap_s, 1)
+        return None
 
     def summary(self) -> dict:
         return {

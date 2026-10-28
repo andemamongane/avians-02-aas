@@ -182,3 +182,19 @@ def test_stopped_flight_is_plotted_with_its_landing(clock, tmp_path, monkeypatch
     live = video._live(f, [r["t"] for r in f.online], f.stop["t"])
     assert live["verdict"] == "violated"
     assert video._live(f, [r["t"] for r in f.online], -1.0) is None
+
+
+def test_a_host_suspension_mid_flight_is_flagged(field_map):
+    """Real time, background sampling: a gap of seconds means the process stood
+    still (the laptop slept), so the flight is flagged as unusable."""
+    backend = FakeBackend()
+    mon = OnlineMonitor("G[0,5] alt <= 8", field_map, backend, threaded=True)
+    mon._t0 = 0.0
+    mon.trace.t[:] = []
+    for t in (0.0, 0.1, 0.2, 6.2, 6.3):           # 6 s with no sample
+        mon.max_gap_s = max(mon.max_gap_s, t - mon.trace.t[-1]) if mon.trace.t else 0.0
+        mon.trace.t.append(t)
+    assert mon.suspended_s() == 6.0
+    calm = OnlineMonitor("G[0,5] alt <= 8", field_map, backend, threaded=False)
+    calm.max_gap_s = 6.0                          # lockstep/single thread: gaps are normal
+    assert calm.suspended_s() is None
