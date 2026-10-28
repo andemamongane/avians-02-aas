@@ -64,6 +64,7 @@ avians score 4                                    # re-score episode 4 against i
 avians plot --all                                 # figures for every episode
 avians video 4                                    # episode 4 as an MP4
 avians showcase --fly                             # every mission x pilot, filmed
+avians compare-controls --fly --backend fake       # every mission plan-ahead vs step-by-step, filmed
 pytest                                            # 164 offline tests
 ```
 
@@ -99,6 +100,15 @@ the end. Everything comes from what the episode recorded.
 (`showcase:` in `config/pilots.yaml`) into `data/showcase/<mission>/<pilot>.mp4`,
 plus `compare.mp4` with all pilots side by side on one clock, and an index
 `data/showcase/README.md`. Add `--fly` to fly the missing pairs first.
+
+`avians compare-controls` flies every mission with the same pilot and flight
+envelope under both control modes (`--fly`; `--refly` to redo them) and films
+`plan.mp4`, `step.mp4` and a side-by-side `compare.mp4` into
+`data/showcase/controls/<mission>/`, with a table of the score, airborne time,
+hovering share, mid-air stops, tool calls and tokens. On the fake backend the
+step-by-step tools fly the same envelope as plans (cruise, acceleration, climb),
+and the drone keeps flying (and being sampled) while the model thinks, so the
+comparison measures the control modes, not the simulator.
 
 ## Missions: map + spec + prompt
 

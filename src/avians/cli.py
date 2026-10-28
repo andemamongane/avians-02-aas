@@ -45,15 +45,25 @@ def _next_episode_dir() -> Path:
     return d
 
 
-def _make_backend(kind: str, aas_cfg: dict):
+def _make_backend(kind: str, aas_cfg: dict, limits: Limits | None = None):
     """Create a backend and, for ROS, start the thread that spins its node.
 
     Nothing else spins the node, so without this thread no callbacks fire,
     no telemetry arrives, and connect() waits out its timeout.
+
+    The fake backend flies the mission's envelope: it cruises like PX4
+    (MPC_XY_CRUISE, which environment.envelope_params sets) and speeds up,
+    brakes and climbs within the envelope's limits, so step-by-step and
+    plan-ahead flights are compared on the same vehicle.
     """
     if kind == "fake":
         from .backends.fake import FakeBackend
-        return FakeBackend(), None
+        if limits is None:
+            return FakeBackend(), None
+        from .environment import envelope_params
+        return FakeBackend(speed=envelope_params(limits)["MPC_XY_CRUISE"],
+                           max_accel=limits.max_accel_ms2, climb=limits.max_climb_ms,
+                           descent=limits.max_descent_ms), None
 
     import threading
 
@@ -146,7 +156,11 @@ def cmd_fly(args: argparse.Namespace) -> int:
     limits = Limits.from_dict(limits_cfg)
     aas_cfg = _load("aas.yaml")
 
-    backend, ros = _make_backend(args.backend, aas_cfg)
+    backend, ros = _make_backend(args.backend, aas_cfg, limits)
+    # Background threads keep the plan flying and the state sampled while a
+    # model thinks. A scripted dry run has no thinking time (and the tests
+    # drive it with a simulated clock), so it stays on one thread.
+    threaded = args.backend != "fake" or not args.dry_run
     episode = _next_episode_dir()
     if mission.get("map"):
         shutil.copy(REPO / mission["map"], episode / "map.yaml")
@@ -190,13 +204,13 @@ def cmd_fly(args: argparse.Namespace) -> int:
             from .trajectory import Envelope
             executor = PlanExecutor(backend, arbiter, mission_map, Envelope.from_limits(limits),
                                     land_timeout=limits_cfg.get("land_timeout_s", 120),
-                                    threaded=(args.backend != "fake"))
+                                    threaded=threaded)
             executor.start()
             tools = PlanToolLayer(executor, mission_map)
         else:
             tools = ToolLayer(skills, arbiter, mission_map)
         monitor = _make_monitor(mission, mission_map, backend, limits_cfg, episode,
-                                threaded=(args.backend != "fake"))
+                                threaded=threaded)
 
         spec_for_agent = mission.get("spec") if mission.get("show_spec", True) else None
         runner = MissionRunner(
@@ -482,6 +496,101 @@ def cmd_showcase(args: argparse.Namespace) -> int:
     return 0
 
 
+def _find_flight(mission: str, pilot: str, control: str, backend: str,
+                 dry_run: bool) -> Path | None:
+    """The latest episode of this mission, pilot, control mode and backend."""
+    found = None
+    for d in sorted(DATA.glob("ep_*")):
+        meta_p = d / "meta.json"
+        if not meta_p.exists():
+            continue
+        meta = json.loads(meta_p.read_text())
+        if (meta.get("mission") == mission and meta.get("control") == control
+                and meta.get("backend") == backend and bool(meta.get("dry_run")) == dry_run
+                and (dry_run or meta.get("pilot") == pilot)
+                and meta.get("terminated_by") != "crashed"):
+            found = d
+    return found
+
+
+def cmd_compare_controls(args: argparse.Namespace) -> int:
+    """Plan-ahead vs step-by-step: the same missions, pilot and envelope,
+    flown both ways and filmed side by side into data/showcase/controls/."""
+    pilots_cfg = _load("pilots.yaml")
+    pilot = args.pilot or pilots_cfg.get("default", "claude")
+    mission_files = [Path(m) for m in args.missions] if args.missions else \
+        sorted((REPO / "missions").glob("*.yaml"))
+    names = {yaml.safe_load(m.read_text())["name"]: m for m in mission_files}
+    controls = ("plan", "step")
+
+    if args.fly:
+        for name, path in names.items():
+            for control in controls:
+                if _find_flight(name, pilot, control, args.backend, args.dry_run) and not args.refly:
+                    continue
+                print(f"\n[compare] flying {name} with {pilot}, {control} control")
+                cmd = [sys.executable, "-m", "avians.cli", "fly", str(path), "--pilot", pilot,
+                       "--control", control, "--backend", args.backend]
+                if args.dry_run:
+                    cmd.append("--dry-run")
+                if subprocess.run(cmd).returncode != 0:
+                    print(f"[compare] {name} with {control} control did not fly; skipping")
+
+    from .plots.flight import flow_metrics, load_episode
+    from .video import render_comparison, render_episode
+    out_root = DATA.parent / "showcase" / "controls"
+    rows, missing = [], []
+    for name in names:
+        eps = {c: _find_flight(name, pilot, c, args.backend, args.dry_run) for c in controls}
+        missing += [f"{name} / {c}" for c, ep in eps.items() if ep is None]
+        for c, ep in eps.items():
+            if ep is None:
+                continue
+            out = render_episode(ep, out_root / name / f"{c}.mp4", speed=args.speed)
+            print(f"[compare] {out}")
+            rows.append((name, c, ep, flow_metrics(load_episode(ep))))
+        if all(eps.values()):
+            out = render_comparison([eps[c] for c in controls], out_root / name / "compare.mp4",
+                                    speed=args.speed, by="control")
+            print(f"[compare] {out}")
+    out_root.mkdir(parents=True, exist_ok=True)
+    (out_root / "README.md").write_text(_compare_md(rows, missing, pilot, pilots_cfg, args))
+    print(f"[compare] {len(rows)} flights filmed; index: {out_root / 'README.md'}")
+    if missing:
+        print("[compare] no flight yet for: " + ", ".join(missing) + " (add --fly)")
+    return 0
+
+
+def _compare_md(rows, missing, pilot, pilots_cfg, args) -> str:
+    who = "Scripted plan (dry run)" if args.dry_run else pilot_label(pilot, pilots_cfg)
+    lines = ["# Plan-ahead vs step-by-step", "",
+             f"The same missions, pilot ({who}), flight envelope and backend "
+             f"(`{args.backend}`), flown with each control mode. `compare.mp4` puts the "
+             "two side by side on one clock.", "",
+             "*airborne* is takeoff to landing; *mission* adds the model's thinking before "
+             "takeoff and its report after landing.", "",
+             "| mission | control | STL | robustness | airborne | mission | hovering | mid-air stops "
+             "| tool calls | tokens | video | episode |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for name, control, ep, flow in rows:
+        meta = json.loads((ep / "meta.json").read_text())
+        stl = json.loads((ep / "stl.json").read_text()) if (ep / "stl.json").exists() else {}
+        tok = meta.get("usage", {})
+        hover = f"{flow['hover_fraction'] * 100:.0f}%" if flow else ""
+        airborne = f"{flow['airborne_s']} s" if flow else ""
+        stops = flow["mid_air_stops"] if flow else ""
+        lines.append(
+            f"| {name} | {control} | "
+            f"{'satisfied' if stl.get('satisfied') else ('violated' if stl else 'n/a')} | "
+            f"{stl.get('robustness', '')} | {airborne} | {meta.get('duration_s', '')} s | "
+            f"{hover} | {stops} | {meta.get('steps', '')} | "
+            f"{tok.get('input_tokens', 0) + tok.get('output_tokens', 0):,} | "
+            f"[{control}.mp4]({name}/{control}.mp4) | {ep.name} |")
+    if missing:
+        lines += ["", "Not flown yet: " + ", ".join(missing)]
+    return "\n".join(lines) + "\n"
+
+
 def _showcase_md(rows, missing, pilots_cfg) -> str:
     lines = ["# avians-02 showcase", "",
              "Each video replays one recorded flight (rosbag trace, the agent's tool calls, ",
@@ -677,6 +786,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="also film scripted (--dry-run) flights")
     sc.add_argument("--speed", type=float, default=4.0, help="playback speed (default 4x)")
     sc.set_defaults(func=cmd_showcase)
+
+    cc = sub.add_parser("compare-controls",
+                        help="plan-ahead vs step-by-step: fly and film each mission both ways")
+    cc.add_argument("--missions", nargs="+", help="mission yamls; default: all")
+    cc.add_argument("--pilot", help="default: `default` in config/pilots.yaml")
+    cc.add_argument("--backend", default="fake", choices=["aas", "fake"])
+    cc.add_argument("--fly", action="store_true", help="first fly the pairs not flown yet")
+    cc.add_argument("--refly", action="store_true", help="with --fly: fly every pair again")
+    cc.add_argument("--dry-run", action="store_true",
+                    help="scripted plans instead of a model (only missions that have both)")
+    cc.add_argument("--speed", type=float, default=4.0, help="playback speed (default 4x)")
+    cc.set_defaults(func=cmd_compare_controls)
 
     v = sub.add_parser("validate", help="check recorded episodes")
     v.add_argument("path", nargs="?")

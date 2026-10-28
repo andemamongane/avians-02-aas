@@ -225,3 +225,21 @@ def test_failed_status_reaches_the_model(stack):
     skills.reposition = boom
     obs = tools.dispatch("reposition", {"east": 1, "north": 1, "altitude": 5})
     assert obs.status == FAILED and "link lost" in obs.reason
+
+
+def test_a_malformed_rejected_call_does_not_break_the_plots(clock, tmp_path, field_map):
+    """A reposition rejected for missing coordinates has no target to draw."""
+    pytest.importorskip("matplotlib")
+    from avians.plots import plot_episode
+    from avians.safety import Limits, SafetyArbiter
+    from avians.skills import Skills
+    from avians.tools import ToolLayer
+    backend = FakeBackend(time_fn=clock.now)
+    tools = ToolLayer(Skills(backend, poll_hz=20), SafetyArbiter(Limits()), field_map)
+    logger = TrajectoryLogger(tmp_path)
+    script = [("takeoff", {"altitude": 5}), ("reposition", {"east": 3}), ("land", {})]
+    MissionRunner(StubPilot(script), tools, logger, "stub").run("t", "fly", {})
+    logger.close()
+    (tmp_path / "meta.json").write_text(json.dumps({"episode": "t", "mission": "t"}))
+    files, _ = plot_episode(tmp_path, 50.0, dpi=30)
+    assert any(f.name == "01_overview.png" for f in files)

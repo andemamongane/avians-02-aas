@@ -27,7 +27,7 @@ from .plots.figures import (                        # noqa: E402
     ACTUAL, AXIS, COMMANDED, GRID, INK, INK_2, MUTED, STATUS, SURFACE,
     call_label, draw_regions,
 )
-from .plots.flight import FlightData, load_episode  # noqa: E402
+from .plots.flight import FlightData, flow_metrics, load_episode  # noqa: E402
 
 W, H, DPI = 19.2, 10.8, 100                         # 1920 x 1080
 PASS, FAIL = STATUS["arrived"], STATUS["failed"]
@@ -43,6 +43,20 @@ class Replay:
         keep = np.concatenate([[True], np.diff(t) > 0])       # np.interp needs increasing t
         self.t, self.n, self.e, self.a = t[keep], f.x[keep], f.y[keep], f.z[keep]
         self.end = max(float(self.t[-1]), max((c.t_end for c in f.calls), default=0.0))
+        plan = f.meta.get("control") == "plan" and np.isfinite(f.sp_x).any()
+        self.plan_t = np.asarray(f.sp_t, dtype=float) if plan else np.array([])
+        self.plan_e, self.plan_n = (f.sp_y, f.sp_x) if plan else (np.array([]), np.array([]))
+
+    def plan_ahead(self, t: float) -> tuple[np.ndarray, np.ndarray]:
+        """The rest of the plan the drone is flying at time t (plan-ahead control)."""
+        if not len(self.plan_t):
+            return np.array([]), np.array([])
+        k = int(np.searchsorted(self.plan_t, t))
+        e, n = self.plan_e[k:], self.plan_n[k:]
+        stop = np.flatnonzero(~np.isfinite(e))               # where the next plan replaced it
+        if len(stop):
+            e, n = e[:stop[0]], n[:stop[0]]
+        return e, n
 
     def at(self, t: float) -> tuple[float, float, float]:
         return (float(np.interp(t, self.t, self.e)), float(np.interp(t, self.t, self.n)),
@@ -65,9 +79,23 @@ class Replay:
         return [(i, c) for i, c in enumerate(self.f.calls, 1) if c.t_start <= t]
 
 
+CONTROL_LABEL = {"plan": "plan-ahead", "step": "step-by-step"}
+
+
+def _control(f: FlightData) -> str:
+    """How the pilot flew it ("" for episodes from before control modes)."""
+    return CONTROL_LABEL.get(f.meta.get("control", ""), "")
+
+
 def _label(f: FlightData) -> str:
-    """Pilot name for titles. Episodes flown before pilots.yaml existed only
-    recorded a model id, so look that up there."""
+    """Pilot and control mode, for titles."""
+    control = _control(f)
+    return _pilot(f) + (f"  ·  {control}" if control else "")
+
+
+def _pilot(f: FlightData) -> str:
+    """Pilot name. Episodes flown before pilots.yaml existed only recorded a
+    model id, so look that up there."""
     if f.meta.get("pilot_label"):
         return f.meta["pilot_label"]
     if f.meta.get("dry_run"):
@@ -115,8 +143,10 @@ def _setup_map(ax, f: FlightData, extent) -> dict:
     nose, = ax.plot([], [], color=INK, lw=2.5, zorder=7)
     targets, = ax.plot([], [], marker="o", markersize=11, color=COMMANDED, zorder=4,
                        markeredgecolor=SURFACE, markeredgewidth=2, linestyle="none")
+    # above the flown trail: a plan home often retraces the way out
+    ahead, = ax.plot([], [], color=COMMANDED, lw=2.0, ls=(0, (4, 3)), zorder=3.5)
     return {"trail": trail, "drone": drone, "nose": nose, "targets": targets,
-            "span": extent[1] - extent[0]}
+            "ahead": ahead, "span": extent[1] - extent[0]}
 
 
 def _update_map(art: dict, r: Replay, t: float) -> None:
@@ -135,6 +165,7 @@ def _update_map(art: dict, r: Replay, t: float) -> None:
            if c.target is not None and c.tool in ("takeoff", "reposition", "goto_region")
            and c.status not in ("rejected", "blocked")]
     art["targets"].set_data([p[0] for p in pts], [p[1] for p in pts])
+    art["ahead"].set_data(*r.plan_ahead(t))
 
 
 def _action_line(r: Replay, t: float) -> tuple[str, str]:
@@ -291,7 +322,9 @@ def render_episode(episode_dir: Path, out: Path, speed: float = 4.0, fps: int = 
 
 # ---------------------------------------------------------------- comparison
 def render_comparison(episode_dirs: list[Path], out: Path, speed: float = 4.0,
-                      fps: int = 30, hold_s: float = 5.0) -> Path:
+                      fps: int = 30, hold_s: float = 5.0, by: str = "pilot") -> Path:
+    """Several flights of one mission side by side on one clock, compared
+    by pilot (same control mode) or by control mode (same pilot)."""
     flights = [load_episode(Path(d)) for d in episode_dirs]
     reps = [Replay(f) for f in flights]
     end = max(r.end for r in reps)
@@ -303,8 +336,10 @@ def render_comparison(episode_dirs: list[Path], out: Path, speed: float = 4.0,
     gs = fig.add_gridspec(2, n, height_ratios=[1, 0.32], left=0.04, right=0.98,
                           top=0.84, bottom=0.03, wspace=0.18, hspace=0.12)
     f0 = flights[0]
-    fig.text(0.04, 0.95, f"{f0.mission}: {n} pilots, same mission", fontsize=26,
-             fontweight="bold", va="center")
+    heading = (f"{f0.mission}: " + " vs ".join(_control(f) for f in flights)
+               + f"  ·  {_pilot(f0)}" if by == "control"
+               else f"{f0.mission}: {n} pilots, same mission")
+    fig.text(0.04, 0.95, heading, fontsize=26, fontweight="bold", va="center")
     spec = f0.stl["spec"] if f0.stl else (f0.meta.get("spec") or "")
     fig.text(0.04, 0.905, textwrap.shorten(f"spec: {spec}", 170), fontsize=13, color=INK_2,
              family="monospace", va="center")
@@ -317,17 +352,19 @@ def render_comparison(episode_dirs: list[Path], out: Path, speed: float = 4.0,
     for k, (f, r) in enumerate(zip(flights, reps)):
         ax = fig.add_subplot(gs[0, k])
         art = _setup_map(ax, f, extent)
-        ax.set_title(_label(f), loc="left", fontsize=18, fontweight="bold")
+        ax.set_title(_control(f).capitalize() if by == "control" else _label(f),
+                     loc="left", fontsize=18, fontweight="bold")
         if k:
             ax.set_ylabel("")
         info = fig.add_subplot(gs[1, k])
         info.set_axis_off()
         act = info.text(0.0, 0.92, "", fontsize=14, transform=info.transAxes, va="top",
                         family="monospace")
-        stats = info.text(0.0, 0.55, "", fontsize=13, transform=info.transAxes, va="top",
+        stats = info.text(0.0, 0.66, "", fontsize=13, transform=info.transAxes, va="top",
                           color=INK_2)
-        verdict = info.text(0.0, 0.15, "", fontsize=17, fontweight="bold",
-                            transform=info.transAxes)
+        # up to three lines (verdict, flight flow, tokens), hanging below the stats
+        verdict = info.text(0.0, 0.44, "", fontsize=16, fontweight="bold",
+                            transform=info.transAxes, va="top", linespacing=1.35)
         panels.append((f, r, art, act, stats, verdict))
 
     writer = _writer(fps, f"{f0.mission} comparison")
@@ -346,8 +383,13 @@ def render_comparison(episode_dirs: list[Path], out: Path, speed: float = 4.0,
                 if final or t >= r.end:
                     v, c = _verdict(f)
                     tok = {} if f.meta.get("dry_run") else f.meta.get("usage", {})
-                    verdict.set_text(v + (f"\n{tok.get('input_tokens', 0) + tok.get('output_tokens', 0):,} tokens"
-                                          if tok else ""))
+                    flow = flow_metrics(f)
+                    verdict.set_text(
+                        v + (f"\n{flow['airborne_s']:.0f} s airborne  ·  "
+                             f"hovering {flow['hover_fraction'] * 100:.0f}%"
+                             f"  ·  {flow['mid_air_stops']} mid-air stops" if flow else "")
+                        + (f"\n{tok.get('input_tokens', 0) + tok.get('output_tokens', 0):,} tokens"
+                           if tok else ""))
                     verdict.set_color(c)
             writer.grab_frame()
     plt.close(fig)

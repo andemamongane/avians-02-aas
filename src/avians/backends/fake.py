@@ -14,10 +14,18 @@ same commands are accepted and rejected in the same states:
     avians trajectory controller: accepted from hover; a new trajectory while
     following replaces the reference without leaving offboard; at the end of
     the trajectory the drone holds its last point; end_follow returns to hover
+
+Given an envelope (max_accel, climb, descent), point-to-point moves speed up
+and brake within it, as PX4's position controller does; without one they
+start and stop instantly (the unit tests' simple kinematics). Every public
+method holds a lock, so background threads (the plan executor, the online
+monitor) can share the backend with the runner.
 """
 from __future__ import annotations
 
+import functools
 import math
+import threading
 import time
 
 from .base import ActionHandle, VehicleState
@@ -26,16 +34,29 @@ ORBIT_SPEED = 5.0           # AAS's mc_orbit_speed_ms default
 TAKEOFF_DONE_RATIO = 0.9    # AAS's mc_takeoff_completed_ratio default
 
 
+def _locked(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class FakeBackend:
     name = "fake"
 
-    def __init__(self, speed: float = 3.0, time_fn=None):
+    def __init__(self, speed: float = 3.0, time_fn=None, max_accel: float | None = None,
+                 climb: float | None = None, descent: float | None = None):
         # Look time.monotonic up at call time (not as a default argument), so a
         # patched clock in tests reaches backends that the CLI creates.
         self._time = time_fn or (lambda: time.monotonic())
         self._t0 = self._time()
         self.state = VehicleState(mode="disarmed")
         self.cruise = speed
+        self.max_accel = max_accel       # None: instant speed changes
+        self.climb, self.descent = climb, descent
+        self._speed = 0.0                # current speed along a point-to-point move
+        self._lock = threading.RLock()
         self.fsm = "landed"              # landed | takeoff | hover | orbit | rtl | landing
         self._target: tuple[float, float, float] | None = None
         self._orbit: tuple[float, float, float, float] | None = None   # e, n, alt, r
@@ -56,6 +77,7 @@ class FakeBackend:
         return self._time() - self._t0
 
     # --- state
+    @_locked
     def get_state(self) -> VehicleState:
         self._integrate()
         self.state.t_sim = self.now()
@@ -65,6 +87,7 @@ class FakeBackend:
         return VehicleState(**vars(self.state))
 
     # --- commands (AAS semantics)
+    @_locked
     def takeoff(self, altitude: float) -> ActionHandle:
         h = ActionHandle(kind="takeoff", target=(self.state.east, self.state.north, altitude))
         if self.fsm != "landed":
@@ -78,6 +101,7 @@ class FakeBackend:
         self._handle = h
         return h
 
+    @_locked
     def reposition(self, east: float, north: float, alt: float,
                    speed: float | None = None) -> ActionHandle:
         h = ActionHandle(kind="reposition", target=(east, north, alt))
@@ -85,12 +109,13 @@ class FakeBackend:
             return h.fail("set_reposition rejected: not in a hover/orbit state")
         self._integrate()
         if speed:
-            self.cruise = speed
+            self.cruise = speed          # the arbiter has already capped it at the envelope
         self.fsm, self.state.mode = "hover", "auto_loiter"
         self._orbit = None
         self._target = (east, north, alt)
         return h.succeed("set_reposition request sent")
 
+    @_locked
     def orbit(self, east: float, north: float, alt: float, radius: float) -> ActionHandle:
         h = ActionHandle(kind="orbit", target=(east, north, alt))
         if self.fsm not in ("hover", "orbit"):
@@ -101,10 +126,12 @@ class FakeBackend:
         self._orbit = (east, north, alt, radius)
         return h.succeed("orbit sent")
 
+    @_locked
     def hold(self) -> ActionHandle:
         s = self.state
         return self.reposition(s.east, s.north, s.alt)
 
+    @_locked
     def land(self, alt: float) -> ActionHandle:
         h = ActionHandle(kind="land", target=(0.0, 0.0, 0.0))
         if self.fsm not in ("hover", "orbit"):
@@ -116,6 +143,7 @@ class FakeBackend:
         self._handle = h
         return h
 
+    @_locked
     def follow(self, traj) -> ActionHandle:
         h = ActionHandle(kind="follow", target=traj.pos[-1])
         if self.fsm not in ("hover", "offboard"):
@@ -126,6 +154,7 @@ class FakeBackend:
         self._traj, self._traj_t0 = traj, self.now()
         return h.succeed("following the trajectory")
 
+    @_locked
     def end_follow(self) -> ActionHandle:
         h = ActionHandle(kind="end_follow")
         if self.fsm != "offboard":
@@ -164,10 +193,22 @@ class FakeBackend:
         te, tn, ta = target
         de, dn, da = te - s.east, tn - s.north, ta - s.alt
         dist = math.sqrt(de * de + dn * dn + da * da)
+        if dist > 0 and da > 0 and self.climb:              # vertical rate limits
+            speed = min(speed, self.climb * dist / da)
+        elif dist > 0 and da < 0 and self.descent:
+            speed = min(speed, self.descent * dist / -da)
+        if self.max_accel:                                  # speed up, and brake to stop
+            # braking: the fastest v from which steps of v*dt, slowing by a*dt
+            # each, still stop at the target (the discrete form of sqrt(2*a*d))
+            a = self.max_accel
+            brake = a * dt * (math.sqrt(1 + 2 * dist / (a * dt * dt)) - 1) if dt > 0 else speed
+            speed = min(speed, self._speed + a * dt, brake)
+            self._speed = speed
         step = speed * dt
-        if dist <= step or dist == 0:
+        if dist <= step + 1e-3:          # within 1 mm: braking approaches it geometrically
             s.east, s.north, s.alt = te, tn, ta
             s.v_east = s.v_north = s.v_up = 0.0
+            self._speed = 0.0
             return True
         f = step / dist
         s.east += de * f

@@ -197,8 +197,12 @@ def _tool_calls(records: list[dict], t0: float) -> list[ToolCall]:
         obs = obs_rec["observation"] if obs_rec else {}
         target = obs.get("target")                     # (east, north, alt)
         a = r.get("args", {})
-        if target is None and r["tool"] == "reposition" and "east" in a:
-            target = (a.get("east"), a.get("north"), a.get("altitude"))
+        # a rejected reposition has no target in its observation: plot the one
+        # asked for, when the call gave all three coordinates (a malformed call
+        # that was rejected for missing some has nothing to plot)
+        if (target is None and r["tool"] == "reposition"
+                and all(isinstance(a.get(k), (int, float)) for k in ("east", "north", "altitude"))):
+            target = (a["east"], a["north"], a["altitude"])
         calls.append(ToolCall(
             tool=r["tool"], args=a,
             t_start=r["t_wall"] - t0,

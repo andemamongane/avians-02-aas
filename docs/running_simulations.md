@@ -170,7 +170,13 @@ avians doctor          # container
 avians fly missions/survey_then_land.yaml --dry-run                    # container: plan-ahead (default)
 avians fly missions/survey_then_land.yaml --control step --dry-run     # container: step-by-step
 avians fly missions/slalom.yaml --backend fake --dry-run               # container: no simulator at all
+avians compare-controls --fly --backend fake                           # container: plan-ahead vs step-by-step, filmed
 ```
+
+`compare-controls` flies each mission both ways with the default pilot (an API
+key is needed; `--dry-run` uses the scripted plans instead) and writes the
+videos and a results table to `data/showcase/controls/`. It needs no simulator,
+so it also runs on the Linux machine inside the avians container.
 
 Open the QGroundControl desktop app on the laptop to watch flights live: the
 container streams PX4's telemetry to it. Stop with `exit`, then

@@ -237,3 +237,49 @@ def test_plan_tools_are_what_the_pilot_gets(clock, tmp_path, field_map):
     system = load_jsonl(tmp_path / "trajectory.jsonl")[0]
     assert {t["name"] for t in system["tools"]} == {
         "get_state", "takeoff", "fly_plan", "wait", "hold", "land", "check_path"}
+
+
+# --- the same vehicle for both control modes -------------------------------------------
+def test_fake_backend_flies_point_to_point_within_the_envelope(clock):
+    """Given an envelope, step-mode moves speed up and brake like PX4, so both
+    control modes are compared on the same vehicle."""
+    b = FakeBackend(speed=12.0, time_fn=clock.now, max_accel=7.0, climb=4.0, descent=3.0)
+    b.connect()
+    b.takeoff(5.0)
+    for _ in range(100):
+        time.sleep(0.05)
+        b.get_state()
+    prev, peak, t0 = b.get_state(), 0.0, clock.now()
+    b.reposition(60.0, 0.0, 5.0)
+    while b.get_state().east < 59.99:
+        time.sleep(0.05)
+        st = b.get_state()
+        assert abs(st.speed - prev.speed) / 0.05 <= 7.0 * 1.1      # 0.05 s integration steps
+        peak, prev = max(peak, st.speed), st
+    assert peak == pytest.approx(12.0, abs=0.1)
+    # 60 m at 12 m/s with 7 m/s^2 ramps: 60/12 + 12/7 s
+    assert clock.now() - t0 == pytest.approx(60 / 12 + 12 / 7, abs=0.2)
+
+
+def test_compare_controls_flies_both_modes_and_indexes_them(clock, tmp_path, monkeypatch):
+    from avians import cli, video
+    monkeypatch.setattr(cli, "DATA", tmp_path / "episodes")
+    filmed = []
+    monkeypatch.setattr(video, "render_episode", lambda ep, out, **kw: filmed.append(out) or out)
+    monkeypatch.setattr(video, "render_comparison",
+                        lambda eps, out, **kw: filmed.append((out, kw.get("by"))) or out)
+    # fly in-process (the command shells out to `avians fly` otherwise)
+    real_run = cli.subprocess.run
+
+    def run(cmd, **kw):
+        if "avians.cli" in cmd:
+            return type("R", (), {"returncode": cli.main(cmd[3:])})()
+        return real_run(cmd, **kw)
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    assert cli.main(["compare-controls", "--missions", str(REPO / "missions/survey_then_land.yaml"),
+                     "--dry-run", "--fly"]) == 0
+    names = [p.name if isinstance(p, type(tmp_path)) else (p[0].name, p[1]) for p in filmed]
+    assert names == ["plan.mp4", "step.mp4", ("compare.mp4", "control")]
+    index = (tmp_path / "showcase" / "controls" / "README.md").read_text()
+    assert "| survey_then_land | plan | satisfied" in index
+    assert "| survey_then_land | step | satisfied" in index
