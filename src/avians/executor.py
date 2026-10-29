@@ -26,8 +26,11 @@ import time
 from .maps import Map
 from .safety import SafetyArbiter
 from .schema import ABORTED, BLOCKED, FAILED, OK, REJECTED, ToolArgError
-from .trajectory import STRAIGHT, Envelope, Knot, Trajectory, build, expand, preview
+from .trajectory import MAX_SEGMENTS, STRAIGHT, Envelope, Knot, Trajectory, build, expand, preview
 from . import clock
+
+TRAIL_STEP_M = 2.0       # breadcrumbs of where the drone has flown, for the way home
+CLEARANCE_M = 3.0        # an emergency shortcut keeps this far from solid and no-fly regions
 
 
 class PlanExecutor:
@@ -65,6 +68,7 @@ class PlanExecutor:
         self._warned_ending = False
         # per region: visits, current stay start, longest and total time inside
         self.progress: dict[str, dict] = {}
+        self.trail: list[tuple[float, float, float]] = []   # flown positions, TRAIL_STEP_M apart
         self._started: Trajectory | None = None    # started since the last observation
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
@@ -169,14 +173,17 @@ class PlanExecutor:
             clock.sleep(self.poll_dt)
 
     def emergency_land(self):
-        """The monitor ended the mission: land now (no interrupts), wait for it."""
+        """The monitor ended the mission: land now (no interrupts), wait for it.
+        The way home avoids solid and no-fly regions (route_home): a straight
+        line from the finish of a slalom would fly through its walls."""
         self.interrupt = None
         self.pending = None
-        status, reason, _ = self.land() if self.phase != "takeoff" else (OK, "", "")
+        status, reason, _ = self.fly_plan(self.route_home()) if self.phase != "takeoff" \
+            else (OK, "", "")
         t_end = self.backend.now() + self.land_timeout
         while self.phase not in ("landed", "ground") and self.backend.now() < t_end:
             if self.phase == "flying" and not self.traj:
-                self.land()                         # the climb just completed
+                self.fly_plan(self.route_home())    # the climb just completed
             self.tick()
             clock.sleep(self.poll_dt)
         landed = self.phase == "landed"
@@ -206,6 +213,9 @@ class PlanExecutor:
             st = self.backend.get_state()
             why = self.interrupt() if self.interrupt else None
             t = self.mission_time()
+            if self.phase in ("takeoff", "flying") and (
+                    not self.trail or math.dist(self.trail[-1], st.pos) >= TRAIL_STEP_M):
+                self.trail.append(st.pos)
             if self.map is not None and self.phase != "ground":
                 if hasattr(self.map, "sense"):           # range-limited sensor
                     for r in self.map.sense(st.east, st.north, t):
@@ -276,6 +286,37 @@ class PlanExecutor:
                     self.phase = "landed"
                     self._event("landed and disarmed")
             return why
+
+    def route_home(self) -> list[dict]:
+        """Segments that fly back to the launch point and land, clear of solid
+        and no-fly regions: back along the drone's own trail (flown, so clear),
+        cutting straight wherever a line keeps CLEARANCE_M from all of them.
+        With nothing in the way that is one straight line, like land."""
+        here = self._reference()[0]
+        full = getattr(self.map, "full", self.map)
+        obstacles = [r for r in (full.regions.values() if full else [])
+                     if r.solid or r.kind == "no_fly"]
+
+        def clear(a, b) -> bool:
+            n = max(1, math.ceil(math.dist(a, b) / 0.5))
+            for k in range(n + 1):
+                e, nn, alt = (a[i] + (b[i] - a[i]) * k / n for i in range(3))
+                if any(r.robustness(e, nn, alt) > -CLEARANCE_M for r in obstacles):
+                    return False
+            return True
+
+        waypoints, cur, last = [], here, len(self.trail)
+        while not clear(cur, (0.0, 0.0, cur[2])) and last > 0:
+            # the trail point nearest home (earliest) in a clear line, else the next one back
+            i = next((i for i in range(last) if clear(cur, self.trail[i])), last - 1)
+            cur, last = self.trail[i], i
+            waypoints.append({"type": "waypoint", "east": round(cur[0], 2),
+                              "north": round(cur[1], 2), "altitude": round(max(
+                                  cur[2], self.arbiter.limits.min_altitude_m), 2)})
+        if len(waypoints) >= MAX_SEGMENTS:                 # a long stretch hugging a wall
+            step = len(waypoints) / (MAX_SEGMENTS - 1)
+            waypoints = [waypoints[int(k * step)] for k in range(MAX_SEGMENTS - 2)] + waypoints[-1:]
+        return waypoints + [{"type": "land"}]
 
     # --- internals ------------------------------------------------------------
     def _queue(self, segments: list, mode: str) -> tuple[str, str, str]:

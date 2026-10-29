@@ -7,6 +7,10 @@ namespace: /Drone1             # AAS runs drone N as /DroneN on ROS domain N
 takeoff_action: takeoff_action
 land_action: land_action
 orbit_action: orbit_action
+offboard_action: offboard_action
+# plan-ahead flight, from avians' AAS patch (docker/aas/, scripts/aas_plan_ahead.sh)
+trajectory_topic: avians/trajectory   # read by px4_offboard's avians_trajectory controller
+offboard_end_topic: offboard_end      # px4_interface ends the offboard action into hover
 set_reposition: set_reposition
 set_speed: set_speed
 
@@ -38,7 +42,9 @@ sim:
   px4_bin: /aas/github_apps/PX4-Autopilot/build/px4_sitl_default/bin
   px4_instance: 0
   px4_log_root: /aas/github_apps/PX4-Autopilot/build/px4_sitl_default
-  record_video: {width: 1280, height: 720, fps: 15}
+  record_video: {width: 1280, height: 720, fps: 15, views: [chase, overview]}
+  plain_world:               # per world: models swapped for a plain ground before takeoff
+    impalpable_greyness: [objects]   # all its shapes, and its ground, are this one model
   # local (PX4 SIH, see docker/entrypoint.sh)
   local_px4_bin: /opt/px4/bin
   local_log_root: /tmp/px4

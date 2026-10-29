@@ -8,12 +8,15 @@ simulation_resources/scripts/gz_wind.py does, never avians.
     avians_gz.py pose   --world W --model x500_0                 print "x y z yaw"
     avians_gz.py spawn  --world W --sdf FILE                      add a model
     avians_gz.py remove --world W --name NAME                     remove a model
+    avians_gz.py move   --world W                                 set poses, spawn, remove: lines on stdin
     avians_gz.py wind   --world W --schedule FILE                 play [[t, east, north], ...]
     avians_gz.py record --world W --model x500_0 --camera-sdf FILE
                         --poses OUT.jsonl --width 1280 --height 720 --fps 15
-        Spawns the chase camera, keeps it behind and above the drone, logs every
-        model pose to OUT.jsonl, and writes raw RGB24 frames to stdout (avians
-        pipes them into ffmpeg). Runs until SIGTERM/SIGINT, then cleans up.
+        Spawns the chase camera, keeps it behind and above the drone (or, with
+        --fixed, where its SDF puts it; --track adds a ground track), logs every
+        model pose to OUT.jsonl (optional), and writes raw RGB24 frames to
+        stdout (avians pipes them into ffmpeg). Runs until SIGTERM/SIGINT, then
+        cleans up.
 
 Wind convention (as gz_wind.py): linear_velocity.x blows toward +X (east),
 .y toward +Y (north), in m/s.
@@ -23,7 +26,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -38,7 +43,21 @@ from gz.msgs10.pose_v_pb2 import Pose_V
 from gz.msgs10.wind_pb2 import Wind
 
 TIMEOUT_MS = 5000
-_stop = threading.Event()
+class _Flag:
+    """A stop flag safe to set from a signal handler. threading.Event is not:
+    a second signal arriving inside Event.set() deadlocks on its lock."""
+
+    def __init__(self) -> None:
+        self._set = False
+
+    def set(self) -> None:
+        self._set = True
+
+    def is_set(self) -> bool:
+        return self._set
+
+
+_stop = _Flag()
 
 
 def _on_signal(*_):
@@ -73,12 +92,13 @@ class PoseCache:
 
     def get(self, name: str, wait_s: float = 10.0) -> Pose | None:
         end = time.time() + wait_s
-        while time.time() < end:
+        while True:
             with self.lock:
                 if name in self.poses:
                     return self.poses[name]
+            if time.time() >= end:
+                return None
             time.sleep(0.05)
-        return None
 
 
 def cmd_pose(node, a) -> int:
@@ -105,6 +125,26 @@ def remove(node, world: str, name: str) -> bool:
     return bool(ok and rep.data)
 
 
+def _self(*args: str) -> list[str]:
+    """This script as a separate process. `record` makes every service request
+    through one: in a process that also receives busy subscriptions (camera
+    images, poses), Gazebo's Python bindings stall requests until they time out."""
+    return [sys.executable, os.path.abspath(__file__), *args]
+
+
+def spawn_confirmed(world: str, sdf_path: str, name: str, poses: PoseCache,
+                    tries: int = 3) -> bool:
+    """Spawn a model and wait until Gazebo reports its pose: the pose stream,
+    not the reply to /create, says whether it exists."""
+    for _ in range(tries):
+        if poses.get(name, wait_s=0.0) is None:
+            subprocess.run(_self("spawn", "--world", world, "--sdf", sdf_path),
+                           capture_output=True, timeout=30)
+        if poses.get(name, wait_s=3.0) is not None:
+            return True
+    return False
+
+
 def cmd_spawn(node, a) -> int:
     with open(a.sdf) as f:
         return 0 if spawn(node, a.world, f.read()) else 1
@@ -112,6 +152,39 @@ def cmd_spawn(node, a) -> int:
 
 def cmd_remove(node, a) -> int:
     return 0 if remove(node, a.world, a.name) else 1
+
+
+def cmd_move(node, a) -> int:
+    """Gazebo requests read from stdin until it closes, one per line:
+    `name x y z qw qx qy qz` sets a pose, `spawn <one-line SDF>` adds a model,
+    `remove <name>` removes one."""
+    set_pose = f"/world/{a.world}/set_pose"
+    for line in sys.stdin:
+        verb, _, rest = line.strip().partition(" ")
+        if verb == "spawn":
+            spawn(node, a.world, rest)
+        elif verb == "remove":
+            remove(node, a.world, rest)
+        elif len(f := line.split()) == 8:
+            req = Pose()
+            req.name = f[0]
+            req.position.x, req.position.y, req.position.z = map(float, f[1:4])
+            (req.orientation.w, req.orientation.x,
+             req.orientation.y, req.orientation.z) = map(float, f[4:8])
+            node.request(set_pose, req, Pose, Boolean, 1000)
+    return 0
+
+
+TRACK_RGB = "0.165 0.471 0.839"                  # avians' ACTUAL blue (plots/figures.py)
+
+
+def _disc(name: str, x: float, y: float, z: float, radius: float) -> str:
+    """A flat blue disc on the ground, visual only, as one line of SDF."""
+    return (f"<?xml version='1.0'?><sdf version='1.9'><model name='{name}'><static>true</static>"
+            f"<pose>{x:.3f} {y:.3f} {z:.3f} 0 0 0</pose><link name='link'><visual name='visual'>"
+            f"<geometry><cylinder><radius>{radius}</radius><length>0.02</length></cylinder>"
+            f"</geometry><material><ambient>{TRACK_RGB} 1</ambient><diffuse>{TRACK_RGB} 1"
+            f"</diffuse></material><cast_shadows>false</cast_shadows></visual></link></model></sdf>")
 
 
 def cmd_wind(node, a) -> int:
@@ -142,13 +215,17 @@ def cmd_wind(node, a) -> int:
 
 
 def cmd_record(node, a) -> int:
-    with open(a.camera_sdf) as f:
-        cam_sdf = f.read()
-    log = open(a.poses, "w", buffering=1)
+    log = open(a.poses, "w", buffering=1) if a.poses else None
     poses = PoseCache(node, a.world, log)
-    if not spawn(node, a.world, cam_sdf):
-        print("could not spawn the chase camera", file=sys.stderr)
+    remove_cam = _self("remove", "--world", a.world, "--name", a.camera_name)
+    if not spawn_confirmed(a.world, a.camera_sdf, a.camera_name, poses):
+        print(f"could not spawn the camera {a.camera_name}", file=sys.stderr)
+        subprocess.run(remove_cam, capture_output=True, timeout=30)
         return 1
+    requests = None
+    if not a.fixed or a.track:
+        requests = subprocess.Popen(_self("move", "--world", a.world), stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, text=True, bufsize=1)
     frame_bytes = a.width * a.height * 3
     out = sys.stdout.buffer
     out_lock = threading.Lock()
@@ -162,31 +239,54 @@ def cmd_record(node, a) -> int:
                     _stop.set()
 
     node.subscribe(Image, a.topic, on_image)
-    set_pose = f"/world/{a.world}/set_pose"
+    pitch = math.atan2(a.height_above, a.distance)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
     yaw_s = None
+    # --track: a disc under the drone and a breadcrumb every metre, like the
+    # dot and ground track of `avians video`; removed when the recording ends
+    marker, crumbs, last_crumb = f"{a.camera_name}_marker", [], None
     try:
+        if a.track:
+            requests.stdin.write(f"spawn {_disc(marker, 0, 0, -1, 0.8)}\n")
         while not _stop.is_set():
-            p = poses.get(a.model, wait_s=1.0)
-            if p is not None:
+            p = None if requests is None else poses.get(a.model, wait_s=1.0)
+            if p is not None and not a.fixed:
                 yaw = _yaw(p.orientation)
                 # smooth the camera's heading so it does not whip round with the drone
                 yaw_s = yaw if yaw_s is None else yaw_s + 0.15 * math.atan2(
                     math.sin(yaw - yaw_s), math.cos(yaw - yaw_s))
-                req = Pose()
-                req.name = a.camera_name
-                req.position.x = p.position.x - a.distance * math.cos(yaw_s)
-                req.position.y = p.position.y - a.distance * math.sin(yaw_s)
-                req.position.z = p.position.z + a.height_above
-                pitch = math.atan2(a.height_above, a.distance)
+                x = p.position.x - a.distance * math.cos(yaw_s)
+                y = p.position.y - a.distance * math.sin(yaw_s)
+                z = p.position.z + a.height_above
                 cy, sy = math.cos(yaw_s / 2), math.sin(yaw_s / 2)
-                cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
-                req.orientation.w, req.orientation.x = cy * cp, -sy * sp
-                req.orientation.y, req.orientation.z = cy * sp, sy * cp
-                node.request(set_pose, req, Pose, Boolean, 200)
+                requests.stdin.write(f"{a.camera_name} {x:.3f} {y:.3f} {z:.3f} "
+                                     f"{cy * cp:.5f} {-sy * sp:.5f} {cy * sp:.5f} {sy * cp:.5f}\n")
+            if p is not None and a.track:
+                x, y = p.position.x, p.position.y
+                requests.stdin.write(f"{marker} {x:.3f} {y:.3f} 0.09 1 0 0 0\n")
+                if last_crumb is None or math.hypot(x - last_crumb[0], y - last_crumb[1]) >= 1.0:
+                    crumbs.append(f"{a.camera_name}_crumb_{len(crumbs)}")
+                    requests.stdin.write(f"spawn {_disc(crumbs[-1], x, y, 0.07, 0.25)}\n")
+                    last_crumb = (x, y)
             time.sleep(1.0 / 30)
+    except BrokenPipeError:
+        print("the request helper stopped", file=sys.stderr)
     finally:
-        remove(node, a.world, a.camera_name)
-        log.close()
+        if requests is not None:
+            try:
+                if a.track:
+                    for name in [marker, *crumbs]:
+                        requests.stdin.write(f"remove {name}\n")
+                requests.stdin.close()
+            except BrokenPipeError:
+                pass
+            try:
+                requests.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                requests.kill()
+        subprocess.run(remove_cam, capture_output=True, timeout=30)
+        if log is not None:
+            log.close()
         with out_lock:
             try:
                 out.flush()
@@ -198,7 +298,7 @@ def cmd_record(node, a) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("pose", "spawn", "remove", "wind", "record"):
+    for name in ("pose", "spawn", "remove", "move", "wind", "record"):
         p = sub.add_parser(name)
         p.add_argument("--world", required=True)
     sub.choices["pose"].add_argument("--model", required=True)
@@ -210,7 +310,10 @@ def main() -> int:
     r.add_argument("--camera-sdf", required=True)
     r.add_argument("--camera-name", default="avians_chase_cam")
     r.add_argument("--topic", default="/avians/chase/image")
-    r.add_argument("--poses", required=True)
+    r.add_argument("--poses", help="log every model's pose to this JSONL file")
+    r.add_argument("--fixed", action="store_true", help="leave the camera where its SDF puts it")
+    r.add_argument("--track", action="store_true",
+                   help="mark the drone and its ground track with blue discs")
     r.add_argument("--width", type=int, default=1280)
     r.add_argument("--height", type=int, default=720)
     r.add_argument("--fps", type=int, default=15)
@@ -221,8 +324,13 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
     node = transport.Node()
     return {"pose": cmd_pose, "spawn": cmd_spawn, "remove": cmd_remove,
-            "wind": cmd_wind, "record": cmd_record}[a.cmd](node, a)
+            "move": cmd_move, "wind": cmd_wind, "record": cmd_record}[a.cmd](node, a)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        pass
+    os._exit(code)  # skip interpreter teardown: Gazebo's Python bindings abort in it

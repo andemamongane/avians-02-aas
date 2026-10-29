@@ -3,7 +3,7 @@
 Step by step, from a fresh machine to a recorded flight. Two setups:
 
 - **Linux GPU machine:** the full aerial-autonomy-stack (AAS) with Gazebo. Wind,
-  worlds, the Gazebo video (`gazebo.mp4`). Sections 1-6.
+  worlds, the Gazebo videos (`gazebo.mp4`, `gazebo_overview.mp4`). Sections 1-6.
 - **Laptop:** PX4 SIH inside the avians container. No Gazebo, no video; good
   for trying missions and pilots. Section 7.
 
@@ -33,6 +33,8 @@ cp .env.example .env              # then put your API keys in .env (ANTHROPIC_AP
 
 cd external/aerial-autonomy-stack/tools_and_docs
 ./sim_build.sh                    # builds the AAS images; long, once
+cd ../../..
+./scripts/aas_plan_ahead.sh       # adds avians' plan-ahead control to AAS's aircraft image; a minute
 ```
 
 AAS's `sim_run.sh` opens every container in an `xterm` window. Without a
@@ -130,8 +132,9 @@ avians fly missions/survey_then_land.yaml --control step --pilot codex   # anoth
 - On the fake backend flights run in lockstep (the simulation pauses while the
   model thinks; decisions take effect 1 s later): the setting for collecting
   data. Add `--clock realtime` to watch the drone fly while the model thinks.
-- On AAS, use `--control step` for now: plan-ahead flight (the default) needs
-  the avians trajectory controller in AAS, which is not written yet.
+- Plan-ahead flight (the default) on AAS needs `./scripts/aas_plan_ahead.sh`
+  (section 2), then a restart of AAS. `avians fly missions/slalom.yaml --dry-run`
+  is a good first check.
 - `--dry-run` replaces the LLM with the mission's scripted plan: everything
   else (tools, safety, AAS, PX4, Gazebo, scoring, video) is real. With
   `--control step` it exists for `hover`, `survey_then_land` and `two_fields`.
@@ -143,6 +146,7 @@ Each flight writes `data/episodes/ep_NNNN/`, visible on the host too:
 | File | What |
 |---|---|
 | `gazebo.mp4` | the chase-camera video from Gazebo |
+| `gazebo_overview.mp4` | Gazebo's whole-map camera, with the drone's ground track |
 | `stl.json`, `plots/summary.md` | the score, and a readable summary |
 | `trajectory.jsonl` | the whole conversation and every tool call |
 | `meta.json` | pilot, envelope, environment; `"sim"` says what the simulator applied and any problems |
@@ -153,7 +157,7 @@ Review (container):
 ```bash
 avians score 12       # re-score episode 12
 avians plot 12        # regenerate its figures
-avians video 12       # the map-and-timeline replay video (separate from gazebo.mp4)
+avians video 12       # the map-and-timeline replay video (separate from the Gazebo videos)
 ```
 
 ## 6. Stop
@@ -197,6 +201,6 @@ container streams PX4's telemetry to it. Stop with `exit`, then
 | a flight leaves only `map.yaml` and an empty `trajectory.jsonl` | it could not connect to the drone (AAS not running) or the simulator was not ready: the reason is in the terminal output |
 | `up_remote.sh`: "AAS is not running" | start AAS first (section 3) |
 | `the mission needs world ... restart AAS with WORLD=...` | the running Gazebo world differs from the mission's |
-| `gazebo.mp4` missing or empty | see `meta.json` → `"sim"` → `"notes"`, and `tmux attach -t aas-Simulation` for Gazebo errors; without a display the camera may not render |
-| `plan-ahead control is not available on AAS yet` | add `--control step` |
+| `gazebo.mp4` or `gazebo_overview.mp4` missing or empty | see `meta.json` → `"sim"` → `"notes"` and the episode's `sim/record*.log`, and `tmux attach -t aas-Simulation` for Gazebo errors; without a display the camera may not render |
+| `AAS has no avians_trajectory controller listening` | run `./scripts/aas_plan_ahead.sh` (host), then restart AAS; or add `--control step` |
 | `already armed` at the start of a flight | the previous flight did not land: restart AAS |
