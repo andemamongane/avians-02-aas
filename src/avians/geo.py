@@ -12,6 +12,7 @@ recording shows them and the drone flies through them as it would through
 lines on a map. `solid: true` on a region adds a collision as well: a real
 obstacle the drone can hit.
 """
+
 from __future__ import annotations
 
 import math
