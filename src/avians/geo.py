@@ -1,5 +1,5 @@
 """Map regions in other tools' coordinates: Gazebo models and QGroundControl KML.
-
+---------------------------------------------------------------------------------
 The map is metres east/north of the launch point. Gazebo's world frame is ENU
 too, offset by where the drone spawns (`anchor`, the model's x, y). QGC wants
 latitude/longitude: the launch point's (`origin`), from the Gazebo world's
