@@ -6,9 +6,12 @@ It is a client of AAS's px4_interface node (autopilot_interface package):
     takeoff_action   autopilot_interface_msgs/action/Takeoff
     land_action      autopilot_interface_msgs/action/Land
     orbit_action     autopilot_interface_msgs/action/Orbit
+    offboard_action  autopilot_interface_msgs/action/Offboard   (plan-ahead)
     set_reposition   autopilot_interface_msgs/srv/SetReposition
     set_speed        autopilot_interface_msgs/srv/SetSpeed
-It never publishes PX4 setpoints itself: AAS owns the low-level control.
+It never publishes PX4 setpoints itself: AAS owns the low-level control. For
+plan-ahead flight it publishes the trajectory, and AAS's px4_offboard tracks it
+with the "avians_trajectory" controller (docker/aas/, scripts/aas_plan_ahead.sh).
 
 Facts this file exists to contain:
   1. Frames. AAS takes east/north metres from the home point it saves at
@@ -25,6 +28,10 @@ Facts this file exists to contain:
      abort_reposition_alt (100 m by default). hold() repositions in place.
   4. PX4 publishes with BEST_EFFORT QoS. A reliable subscriber gets nothing,
      silently. If state never arrives, check this first.
+  5. Plan-ahead: one offboard action per stretch of plan-following, with a long
+     max_duration; trajectories are timed from when the controller receives
+     them (its clock is Gazebo's, ours the wall clock); end_follow ends the
+     action through the patched px4_interface's offboard_end, into hover.
 """
 from __future__ import annotations
 
@@ -36,9 +43,10 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from autopilot_interface_msgs.action import Land, Orbit, Takeoff
+from autopilot_interface_msgs.action import Land, Offboard, Orbit, Takeoff
 from autopilot_interface_msgs.srv import SetReposition, SetSpeed
 from px4_msgs.msg import BatteryStatus, VehicleLocalPosition, VehicleStatus
+from std_msgs.msg import Empty, Float64MultiArray
 
 from .base import ActionHandle, VehicleState
 
@@ -59,7 +67,31 @@ REJECTED_BECAUSE = {
     "takeoff": "it accepts takeoff only on the ground with preflight checks passing",
     "land": "it accepts land only while hovering or orbiting",
     "orbit": "it accepts orbit only while hovering or orbiting",
+    "offboard": "it accepts offboard only while hovering",
 }
+
+TRAJECTORY_CONTROLLER = "avians_trajectory"
+TRAJECTORY_QOS = QoSProfile(                       # the controller's subscription
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+)
+TRAJECTORY_DT = 0.05                               # s between the samples sent
+
+
+def trajectory_message(traj, origin_ned) -> Float64MultiArray:
+    """A trajectory as the avians_trajectory controller reads it: samples of
+    {t, N, E, D, vN, vE, vD}, in PX4's local NED frame (our east/north/alt are
+    measured from origin_ned, where the drone rested at connect)."""
+    ox, oy, oz = origin_ned
+    n = max(1, math.ceil(traj.duration / TRAJECTORY_DT))
+    data = []
+    for k in range(n + 1):
+        t = min(k * TRAJECTORY_DT, traj.duration)
+        (east, north, alt), (ve, vn, vu) = traj.sample(t)
+        data += [t, north + ox, east + oy, oz - alt, vn, ve, -vu]
+    return Float64MultiArray(data=data)
 
 
 class AasBackend(Node):
@@ -87,6 +119,14 @@ class AasBackend(Node):
         self.takeoff_client = ActionClient(self, Takeoff, name("takeoff_action"))
         self.land_client = ActionClient(self, Land, name("land_action"))
         self.orbit_client = ActionClient(self, Orbit, name("orbit_action"))
+        self.offboard_client = ActionClient(self, Offboard,
+                                            name("offboard_action"))
+        self.trajectory_pub = self.create_publisher(
+            Float64MultiArray, name("trajectory_topic"), TRAJECTORY_QOS)
+        self.offboard_end_pub = self.create_publisher(
+            Empty, name("offboard_end_topic"), QoSProfile(depth=1))
+        self._offboard: ActionHandle | None = None      # the offboard action while following
+        self._traj_end: tuple[float, float, float] | None = None   # where the trajectory stops
         self.reposition_client = self.create_client(SetReposition, name("set_reposition"))
         self.speed_client = self.create_client(SetSpeed, name("set_speed"))
 
@@ -176,18 +216,66 @@ class AasBackend(Node):
         goal.landing_altitude = float(alt)
         return self._send(self.land_client, goal, h)
 
-    # Plan-ahead control. To be built on the Linux machine: one offboard_action
-    # per flight (controller "avians_trajectory", a controller added to AAS's
-    # offboard_control package) that tracks the latest trajectory published on
-    # a topic; a new trajectory replaces the reference; end_follow needs a small
-    # AAS patch to finish the offboard action into Loiter without the abort climb.
+    # Plan-ahead control (fact 5 above)
     def follow(self, traj) -> ActionHandle:
-        return ActionHandle(kind="follow").fail(
-            "plan-ahead control is not available on AAS yet (needs the avians "
-            "trajectory controller); fly this mission with --control step")
+        h = ActionHandle(kind="follow", target=traj.pos[-1])
+        if self._offboard is None or self._offboard.done:
+            why = self._start_offboard()
+            if why:
+                return h.fail(why)
+        self.trajectory_pub.publish(trajectory_message(traj, self.frame_origin_ned or (0, 0, 0)))
+        self._traj_end = traj.pos[-1]
+        return h.succeed("following the trajectory")
 
     def end_follow(self) -> ActionHandle:
-        return ActionHandle(kind="end_follow").fail("plan-ahead control is not available on AAS yet")
+        h = ActionHandle(kind="end_follow")
+        off = self._offboard
+        if off is None or off.done:
+            return h.fail("not in offboard")
+        # The reference may have stopped while the drone, behind it, is still
+        # flying: ending offboard now would leave PX4's Loiter to brake from
+        # speed, which costs altitude (it hit the ground from 8 m at 13 m/s).
+        # The controller holds the last point; end once the drone is there.
+        end = self._traj_end
+        self._wait(lambda: end is None or (
+            math.dist(self.get_state().pos, end) < 1.0 and self.get_state().speed < 0.5),
+            float(self.cfg.get("offboard_settle_timeout_s", 15)))
+        self.offboard_end_pub.publish(Empty())
+        if not self._wait(lambda: off.done, float(self.cfg.get("offboard_end_timeout_s", 5))):
+            return h.fail("offboard did not end (is AAS's px4_interface patched? "
+                          "scripts/aas_plan_ahead.sh)")
+        self._offboard = None
+        return h.succeed("offboard ended, hovering") if off.ok else h.fail(off.result)
+
+    def _start_offboard(self) -> str:
+        """Start the offboard action and wait until PX4 flies it. Returns why
+        not, or "". The controller holds position until the first trajectory."""
+        if self.trajectory_pub.get_subscription_count() == 0:
+            return ("AAS has no avians_trajectory controller listening: build the patched "
+                    "aircraft image (scripts/aas_plan_ahead.sh) and restart AAS, or fly "
+                    "with --control step")
+        goal = Offboard.Goal()
+        goal.controller_name = TRAJECTORY_CONTROLLER
+        goal.max_duration_sec = float(self.cfg.get("offboard_max_s", 3600))
+        off = self._send(self.offboard_client, goal, ActionHandle(kind="offboard"))
+        timeout = float(self.cfg.get("offboard_start_timeout_s", 6))
+        if not self._wait(lambda: off.done or off.feedback.get("accepted"), timeout) or off.done:
+            return off.result or "the offboard action was not accepted"
+        # AAS switches PX4 to offboard 1-2 s after accepting (custom modes: at once)
+        if not self._wait(lambda: self.get_state().mode == "offboard"
+                          or self.get_state().mode.startswith("nav_"), timeout):
+            return f"PX4 did not switch to offboard within {timeout:.0f} s"
+        self._offboard = off
+        return ""
+
+    @staticmethod
+    def _wait(condition, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while not condition():
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.02)
+        return True
 
     def orbit(self, east: float, north: float, alt: float, radius: float) -> ActionHandle:
         h = ActionHandle(kind="orbit", target=(east, north, alt))
@@ -229,6 +317,7 @@ class AasBackend(Node):
                 h.fail(f"the autopilot interface rejected {h.kind}"
                        + (f" ({why}, and no other command active)" if why else ""))
                 return
+            h.feedback["accepted"] = True
             gh.get_result_async().add_done_callback(on_result)
 
         def on_result(fut) -> None:

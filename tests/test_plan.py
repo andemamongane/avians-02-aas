@@ -10,6 +10,7 @@ import pytest
 from avians.backends.fake import FakeBackend
 from avians.executor import PlanExecutor
 from avians.logging.adp import load_jsonl
+from avians.maps import Map
 from avians.logging.trajectory import TrajectoryLogger
 from avians.runner import MissionRunner, RunCaps
 from avians.safety import Limits, SafetyArbiter, resolve
@@ -283,3 +284,34 @@ def test_compare_controls_flies_both_modes_and_indexes_them(clock, tmp_path, mon
     index = (tmp_path / "showcase" / "controls" / "README.md").read_text()
     assert "| survey_then_land | plan | satisfied" in index
     assert "| survey_then_land | step | satisfied" in index
+
+
+# --- the way home after the monitor stops a mission ---------------------------
+def test_emergency_landing_goes_round_solid_walls(clock):
+    """From the slalom finish, straight home crosses two solid walls (in Gazebo,
+    a crash). The emergency landing must fly back round them."""
+    course = Map.load(REPO / "maps" / "course_01.yaml")
+    backend = FakeBackend(time_fn=clock.now)
+    backend.connect()
+    ex = PlanExecutor(backend, SafetyArbiter(AGGRESSIVE), course, Envelope.from_limits(AGGRESSIVE))
+    tools = PlanToolLayer(ex, course)
+    tools.dispatch("takeoff", {"altitude": 8})
+    tools.dispatch("fly_plan", {"segments": [WP(40, 32, 8), WP(-40, 62, 8), WP(40, 92, 8),
+                                             {"type": "region", "region": "finish", "altitude": 8}]})
+    tools.dispatch("wait", {"seconds": 120, "until": "plan_complete"})
+    assert course.get("finish").contains(*backend.get_state().pos[:2])
+    walls = [course.get(w) for w in ("wall_1", "wall_2", "wall_3")]
+    flown, get_state = [], backend.get_state
+    backend.get_state = lambda: flown.append(get_state().pos) or get_state()
+    status, reason, final = ex.emergency_land()
+    assert status == "arrived" and not final.armed
+    assert math.hypot(final.east, final.north) < 1.0
+    assert not [p for p in flown if any(w.contains(*p) for w in walls)]
+
+
+def test_emergency_landing_is_straight_home_when_nothing_is_in_the_way(plan_stack):
+    backend, ex, tools = plan_stack
+    tools.dispatch("takeoff", {"altitude": 5})
+    tools.dispatch("fly_plan", {"segments": [WP(20, 20), WP(-15, 18)]})
+    tools.dispatch("wait", {"seconds": 60, "until": "plan_complete"})
+    assert ex.route_home() == [{"type": "land"}]       # (20, 20) home would cross nofly_1

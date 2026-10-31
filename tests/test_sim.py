@@ -64,7 +64,7 @@ def test_gusts_are_reproducible_and_have_the_requested_spread():
 
 def test_envelope_becomes_px4_parameters():
     p = envelope_params(AGGRESSIVE)
-    assert p["MPC_XY_VEL_MAX"] == 15 and p["MPC_ACC_HOR_MAX"] == 7
+    assert p["MPC_XY_VEL_MAX"] == 18 and p["MPC_ACC_HOR_MAX"] == 7   # 1.2 x 15: catch-up headroom
     assert p["MPC_TILTMAX_AIR"] == 45 and p["MPC_JERK_MAX"] == 20
     assert "MPC_TILTMAX_AIR" not in envelope_params(Limits())       # standard: PX4's own
 
@@ -90,8 +90,27 @@ def test_kml_and_region_models_are_valid(field_map):
     course = Map.load(REPO / "maps/course_01.yaml")
     wall = ET.fromstring(geo.region_models(course)["avians_region_wall_1"].split("?>", 1)[1])
     assert wall.find(".//collision") is not None                   # solid: a real obstacle
-    assert float(wall.find(".//height").text) == 40
+    assert float(wall.find(".//visual[@name='volume']//height").text) == 40
+    assert float(wall.find(".//collision//height").text) == 40
+    survey = ET.fromstring(geo.region_models(field_map)["avians_region_survey_a"].split("?>", 1)[1])
+    assert survey.find(".//visual[@name='volume']/pose").text.startswith("0 0 3.000")  # 3-8 m band
+    assert len(survey.findall(".//visual")) == 1 + 4 + 1          # patch, 4 edges, volume
     ET.fromstring(geo.chase_camera_model().split("?>", 1)[1])
+    ET.fromstring(geo.plain_ground_model().split("?>", 1)[1])
+
+
+def test_overview_camera_frames_the_whole_map(field_map):
+    sdf = geo.overview_camera_model(field_map, anchor=(2.0, -1.0), width=1280, height=720)
+    x, y, z, roll, pitch, yaw = map(float, ET.fromstring(sdf.split("?>", 1)[1]).find("model/pose").text.split())
+    pts = [(0.0, 0.0)] + [p for r in field_map.regions.values() for p in r.polygon]
+    half_h = math.tan(geo.CAMERA_HFOV / 2)
+    half_v = half_h * 720 / 1280
+    for e, n in pts:                                    # every corner projects inside the image
+        dx, dy, dz = e + 2.0 - x, n - 1.0 - y, -z     # camera looks north (yaw 90 deg), pitched down
+        fwd = dy * math.cos(pitch) - dz * math.sin(pitch)
+        up = dy * math.sin(pitch) + dz * math.cos(pitch)
+        assert fwd > 0 and abs(dx) / fwd < half_h and abs(up) / fwd < half_v, (e, n)
+    assert yaw == pytest.approx(math.pi / 2, abs=1e-3) and roll == 0
 
 
 # --- sim control ---------------------------------------------------------------------
@@ -137,7 +156,7 @@ def test_remote_prepare_start_stop(tmp_path, field_map):
     sim.start(horizon_s=60)
     sim.stop()
     calls = d.joined()
-    assert any("px4-param --instance 0 set MPC_XY_VEL_MAX 15" in c for c in calls)
+    assert any("px4-param --instance 0 set MPC_XY_VEL_MAX 18" in c for c in calls)
     assert any("set SYS_FAILURE_EN 1" in c for c in calls)
     spawns = [c for c in calls if "avians_gz.py spawn" in c]
     assert len(spawns) == len(field_map.regions)
@@ -150,6 +169,41 @@ def test_remote_prepare_start_stop(tmp_path, field_map):
     assert any(c.endswith("px4.ulg") and "docker cp" in c for c in calls)
     assert (tmp_path / "wind.json").exists()
     assert sim.summary()["world"] == "impalpable_greyness"
+
+
+def test_plain_world_and_two_cameras(tmp_path, field_map):
+    d = Docker()
+    cfg = {"plain_world": {"impalpable_greyness": ["objects"]}}
+    sim = SimControl(cfg, tmp_path, "remote", run=d.run, popen=d.popen)
+    sim.prepare(Environment(), AGGRESSIVE, field_map)
+    sim.start(horizon_s=60)
+    sim.stop()
+    calls = d.joined()
+    ground = next(i for i, c in enumerate(calls) if "spawn" in c and "avians_ground.sdf" in c)
+    scenery = next(i for i, c in enumerate(calls) if "remove" in c and "--name objects" in c)
+    assert ground < scenery                         # the new ground first: the drone stands on it
+    assert sim.summary()["plain_world"] == ["objects"]
+    records = [c for c in calls if "avians_gz.py record" in c]
+    assert len(records) == 2 and sum("--fixed" in c for c in records) == 1
+    assert len({c.split("--camera-name ")[1].split()[0] for c in records}) == 2
+    assert any(c.endswith("gazebo.mp4") for c in calls)
+    assert any(c.endswith("gazebo_overview.mp4") for c in calls)
+    assert any("kill -TERM $(cat /tmp/avians/record_overview.pid)" in c for c in calls)
+
+
+def test_plain_world_keeps_the_scenery_without_a_new_ground(tmp_path):
+    class NoGround(Docker):
+        def run(self, cmd, **kw):
+            if "--model avians_ground" in " ".join(cmd):
+                self.calls.append(cmd)
+                return subprocess.CompletedProcess(cmd, 1, "", "no pose")
+            return super().run(cmd, **kw)
+    d = NoGround()
+    cfg = {"plain_world": {"impalpable_greyness": ["objects"]}}
+    sim = SimControl(cfg, tmp_path, "remote", run=d.run, popen=d.popen)
+    sim.prepare(Environment(), AGGRESSIVE, None)
+    assert not any("--name objects" in c for c in d.joined())
+    assert any("kept the world's scenery" in n for n in sim.notes)
 
 
 def test_wrong_world_stops_before_flying(tmp_path):

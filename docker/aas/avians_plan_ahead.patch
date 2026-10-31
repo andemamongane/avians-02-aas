@@ -1,0 +1,234 @@
+diff --git a/autopilot_interface/src/px4_interface.cpp b/autopilot_interface/src/px4_interface.cpp
+index b05a2f6..a088df4 100644
+--- a/autopilot_interface/src/px4_interface.cpp
++++ b/autopilot_interface/src/px4_interface.cpp
+@@ -60,6 +60,10 @@ PX4Interface::PX4Interface() : Node("px4_interface"),
+     // Offboard flag publisher
+     offboard_flag_pub_ = this->create_publisher<autopilot_interface_msgs::msg::OffboardFlag>("/offboard_flag", qos_profile_pub);
+ 
++    // Offboard end subscriber (unlike a cancel, which aborts, this exits offboard into loiter/hover)
++    offboard_end_sub_ = this->create_subscription<std_msgs::msg::Empty>("offboard_end", rclcpp::QoS(1).reliable(),
++        [this](const std_msgs::msg::Empty::SharedPtr) { offboard_end_requested_.store(true); });
++
+     // Create callback groups (Reentrant or MutuallyExclusive)
+     callback_group_printout_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive); // Strictly sequential callbacks
+     callback_group_offboard_control_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive); // Strictly sequential callbacks
+@@ -574,6 +578,7 @@ void PX4Interface::offboard_handle_accepted(const std::shared_ptr<rclcpp_action:
+     double max_duration_sec = goal->max_duration_sec;
+ 
+     offboard_flag_count_ = 0;
++    offboard_end_requested_.store(false); // Only a request sent during this action ends it
+     bool offboarding = true;
+     uint64_t time_of_offboard_start_us = UNSET_TIME_US;
+     rclcpp::Rate offboard_loop_rate(ACTION_LOOP_RATE_HZ);
+@@ -609,7 +614,7 @@ void PX4Interface::offboard_handle_accepted(const std::shared_ptr<rclcpp_action:
+             feedback->message = "Starting offboard control at t=" + std::to_string(time_of_offboard_start_us) + " us";
+             goal_handle->publish_feedback(feedback);
+         }
+-        if (current_time_us >= time_of_offboard_start_us + sec_to_us(max_duration_sec)) {
++        if (current_time_us >= time_of_offboard_start_us + sec_to_us(max_duration_sec) || offboard_end_requested_.exchange(false)) {
+             time_of_offboard_start_us = UNSET_TIME_US;
+             offboarding = false;
+             do_set_mode(4, 3); // Auto/Loiter (PX4_CUSTOM_MAIN_MODE 4/PX4_CUSTOM_SUB_MODE_AUTO 3)
+diff --git a/autopilot_interface/src/px4_interface.hpp b/autopilot_interface/src/px4_interface.hpp
+index c8f704e..7369cc4 100644
+--- a/autopilot_interface/src/px4_interface.hpp
++++ b/autopilot_interface/src/px4_interface.hpp
+@@ -32,6 +32,7 @@
+ #include <px4_msgs/msg/vehicle_command.hpp>
+ 
+ #include "autopilot_interface_msgs/msg/offboard_flag.hpp"
++#include "std_msgs/msg/empty.hpp"
+ 
+ #include "autopilot_interface_msgs/srv/set_speed.hpp"
+ #include "autopilot_interface_msgs/srv/set_reposition.hpp"
+@@ -140,6 +141,10 @@ private:
+     // Offboard flag publisher
+     rclcpp::Publisher<autopilot_interface_msgs::msg::OffboardFlag>::SharedPtr offboard_flag_pub_;
+ 
++    // Offboard end subscriber: finish the active offboard action now, into loiter/hover as at max_duration_sec
++    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr offboard_end_sub_;
++    std::atomic<bool> offboard_end_requested_{false};
++
+     // Node Services
+     rclcpp::Service<autopilot_interface_msgs::srv::SetSpeed>::SharedPtr set_speed_service_;
+     rclcpp::Service<autopilot_interface_msgs::srv::SetReposition>::SharedPtr set_reposition_service_;
+diff --git a/offboard_control/src/px4_offboard.cpp b/offboard_control/src/px4_offboard.cpp
+index 716b06c..5865d16 100644
+--- a/offboard_control/src/px4_offboard.cpp
++++ b/offboard_control/src/px4_offboard.cpp
+@@ -11,7 +11,7 @@ PX4Offboard::PX4Offboard() : Node("px4_offboard"),
+     traj_ref_east_(NAN), traj_ref_north_(NAN), traj_ref_up_(NAN),
+     target_vn_(NAN), target_ve_(NAN), target_vd_(NAN),
+     detect_az_rad_(NAN), detect_el_rad_(NAN), detect_fix_count_(0),
+-    lawnmower_leg_(0)
++    lawnmower_leg_(0), avians_yaw_(NAN)
+ {
+     RCLCPP_INFO(this->get_logger(), "PX4 offboard referencing!");
+     RCLCPP_INFO(this->get_logger(), "namespace: %s", this->get_namespace());
+@@ -42,6 +42,7 @@ PX4Offboard::PX4Offboard() : Node("px4_offboard"),
+     kiss_position_.fill(NAN);
+     kiss_q_.fill(NAN);
+     detect_fix_ned_.fill(NAN);
++    avians_hold_.fill(NAN);
+ 
+     // Parameters
+     search_classes_ = this->declare_parameter<std::vector<std::string>>("search_classes", {"car", "truck"});
+@@ -104,6 +105,11 @@ PX4Offboard::PX4Offboard() : Node("px4_offboard"),
+         "/offboard_flag", qos_profile_sub, // 10Hz
+         std::bind(&PX4Offboard::offboard_flag_callback, this, std::placeholders::_1), subscriber_options);
+ 
++    // avians trajectory subscriber: reliable and transient local, so a trajectory published just before this node listens still arrives
++    avians_trajectory_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
++        "avians/trajectory", rclcpp::QoS(1).reliable().transient_local(),
++        std::bind(&PX4Offboard::avians_trajectory_callback, this, std::placeholders::_1), subscriber_options);
++
+     // Perception subscribers
+     ground_tracks_sub_ = this->create_subscription<ground_system_msgs::msg::SwarmObs>(
+         "/tracks", qos_profile_sub, // 10Hz
+@@ -125,6 +131,8 @@ PX4Offboard::PX4Offboard() : Node("px4_offboard"),
+     // Vision-based guidance
+     controller_map_["traj-lm"] = [this](OffboardControlMode& mode) { traj_ref_lawnmower_search(mode, {{0.0, -75.0}, {150.0, 300.0}, 14.0, 25.0, 10.0, false}); }; // East {start, end}, North {min, max}, altitude, leg separation, speed ceiling, re-attack
+     controller_map_["traj-lmr"] = [this](OffboardControlMode& mode) { traj_ref_lawnmower_search(mode, {{-75.0, 0.0}, {150.0, 300.0}, 12.0, 25.0, 10.0, true}); }; // East {start, end}, North {min, max}, altitude, leg separation, speed ceiling, re-attack
++    // Plan-ahead flight for avians: tracks the latest trajectory published on avians/trajectory
++    controller_map_["avians_trajectory"] = std::bind(&PX4Offboard::traj_ref_avians, this, std::placeholders::_1);
+ 
+     // (optional) Register one custom mode per controller through PX4 ROS2 Interface Lib, e.g. "AAS traj-test", selectable in QGC
+     if (this->declare_parameter<bool>("px4_ros2_lib", false)) {
+@@ -221,8 +229,21 @@ void PX4Offboard::offboard_flag_callback(const autopilot_interface_msgs::msg::Of
+     } else { // Clean up when offboard flag is inactive
+         active_controller_name_ = "";
+         active_controller_func_ = nullptr;
++        avians_traj_.clear(); // The next offboard action starts by holding where the vehicle is
++        avians_hold_.fill(NAN);
++        avians_yaw_ = NAN;
+     }
+ }
++void PX4Offboard::avians_trajectory_callback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
++{
++    std::unique_lock<std::shared_mutex> lock(node_data_mutex_); // Use unique_lock for data writes
++    if (msg->data.size() < AVIANS_SAMPLE_SIZE || (msg->data.size() % AVIANS_SAMPLE_SIZE) != 0) {
++        RCLCPP_WARN(get_logger(), "avians trajectory ignored: %zu values is not a whole number of samples", msg->data.size());
++        return;
++    }
++    avians_traj_ = msg->data; // A new trajectory replaces the reference, timed from now
++    avians_traj_t0_ = this->get_clock()->now();
++}
+ void PX4Offboard::ground_tracks_callback(const ground_system_msgs::msg::SwarmObs::SharedPtr msg)
+ {
+     std::unique_lock<std::shared_mutex> lock(node_data_mutex_); // Use unique_lock for data writes
+@@ -655,6 +676,64 @@ void PX4Offboard::traj_ref_lawnmower_search(OffboardControlMode& mode, const Law
+     publish_ref(trajectory_ref);
+ }
+ 
++void PX4Offboard::traj_ref_avians(OffboardControlMode& mode)
++{
++    constexpr double YAW_FROM_SPEED_MS = 1.0; // m/s, face the direction of travel above this horizontal speed
++
++    if (vehicle_type_ != 1) { // Publish nothing if the vehicle is not ROTARY_WING
++        RCLCPP_WARN(get_logger(), "This controller is only for multicopters");
++        return;
++    }
++    mode.position = true;
++    mode.velocity = true; // Velocity (and acceleration) feedforward
++    TrajectorySetpoint trajectory_ref; // https://github.com/PX4/px4_msgs/blob/release/1.17/msg/TrajectorySetpoint.msg
++    trajectory_ref.timestamp = mode.timestamp;
++    trajectory_ref.jerk = {NAN, NAN, NAN}; // Unused
++    trajectory_ref.yawspeed = NAN;         // Unused, the absolute yaw does the steering
++    if (std::isnan(avians_yaw_)) { avians_yaw_ = heading_; }
++
++    const size_t n = avians_traj_.size() / AVIANS_SAMPLE_SIZE;
++    if (n == 0) { // No trajectory yet: hold where the vehicle was when this controller started
++        if (std::isnan(avians_hold_[0])) { avians_hold_ = {x_, y_, z_, heading_}; }
++        trajectory_ref.position = {static_cast<float>(avians_hold_[0]), static_cast<float>(avians_hold_[1]), static_cast<float>(avians_hold_[2])};
++        trajectory_ref.velocity = {0.0, 0.0, 0.0};
++        trajectory_ref.acceleration = {NAN, NAN, NAN};
++        trajectory_ref.yaw = static_cast<float>(avians_hold_[3]);
++        publish_ref(trajectory_ref);
++        return;
++    }
++    const double *d = avians_traj_.data();
++    auto sample_t = [d](size_t k) { return d[k * AVIANS_SAMPLE_SIZE]; };
++    double t = (this->get_clock()->now() - avians_traj_t0_).seconds();
++    std::array<double, 3> pos, vel, acc = {0.0, 0.0, 0.0};
++    if (n == 1 || t >= sample_t(n - 1)) { // Past the end: hold the last point
++        const double *s = d + ((n - 1) * AVIANS_SAMPLE_SIZE);
++        pos = {s[1], s[2], s[3]};
++        vel = {0.0, 0.0, 0.0};
++    } else {
++        t = std::max(t, sample_t(0));
++        size_t lo = 0, hi = n - 1; // Binary search for sample_t(lo) <= t < sample_t(hi), with hi == lo + 1
++        while (hi - lo > 1) {
++            size_t mid = (lo + hi) / 2;
++            if (sample_t(mid) <= t) { lo = mid; } else { hi = mid; }
++        }
++        const double *a = d + (lo * AVIANS_SAMPLE_SIZE), *b = d + (hi * AVIANS_SAMPLE_SIZE);
++        double dt = std::max(1e-6, b[0] - a[0]);
++        double u = std::clamp((t - a[0]) / dt, 0.0, 1.0);
++        for (int i = 0; i < 3; i++) {
++            pos[i] = a[1 + i] + (u * (b[1 + i] - a[1 + i]));
++            vel[i] = a[4 + i] + (u * (b[4 + i] - a[4 + i]));
++            acc[i] = (b[4 + i] - a[4 + i]) / dt;
++        }
++    }
++    if (std::hypot(vel[0], vel[1]) > YAW_FROM_SPEED_MS) { avians_yaw_ = std::atan2(vel[1], vel[0]); } // NED yaw of the velocity, in [-PI:PI]
++    trajectory_ref.position = {static_cast<float>(pos[0]), static_cast<float>(pos[1]), static_cast<float>(pos[2])};
++    trajectory_ref.velocity = {static_cast<float>(vel[0]), static_cast<float>(vel[1]), static_cast<float>(vel[2])};
++    trajectory_ref.acceleration = {static_cast<float>(acc[0]), static_cast<float>(acc[1]), static_cast<float>(acc[2])};
++    trajectory_ref.yaw = static_cast<float>(avians_yaw_);
++    publish_ref(trajectory_ref);
++}
++
+ int main(int argc, char *argv[])
+ {    
+     rclcpp::init(argc, argv);
+diff --git a/offboard_control/src/px4_offboard.hpp b/offboard_control/src/px4_offboard.hpp
+index 7cf233e..45999bb 100644
+--- a/offboard_control/src/px4_offboard.hpp
++++ b/offboard_control/src/px4_offboard.hpp
+@@ -39,6 +39,7 @@
+ #include <px4_msgs/msg/trajectory_setpoint.hpp>
+ 
+ #include "autopilot_interface_msgs/msg/offboard_flag.hpp"
++#include "std_msgs/msg/float64_multi_array.hpp"
+ 
+ #include <nav_msgs/msg/odometry.hpp>
+ #include "ground_system_msgs/msg/swarm_obs.hpp"
+@@ -106,6 +107,9 @@ private:
+     // Offboard flag subscriber
+     rclcpp::Subscription<autopilot_interface_msgs::msg::OffboardFlag>::SharedPtr offboard_flag_sub_;
+ 
++    // avians trajectory subscriber (plan-ahead flight, controller "avians_trajectory")
++    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr avians_trajectory_sub_;
++
+     // Perception subscribers
+     rclcpp::Subscription<ground_system_msgs::msg::SwarmObs>::SharedPtr ground_tracks_sub_;
+     rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr yolo_detections_sub_;
+@@ -163,6 +167,9 @@ private:
+     // Offboard flag call back
+     void offboard_flag_callback(const autopilot_interface_msgs::msg::OffboardFlag::SharedPtr msg);
+ 
++    // avians trajectory call back
++    void avians_trajectory_callback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
++
+     // Callbacks for perception subscribers
+     void ground_tracks_callback(const ground_system_msgs::msg::SwarmObs::SharedPtr msg);
+     void yolo_detections_callback(const vision_msgs::msg::Detection2DArray::SharedPtr msg);
+@@ -188,9 +195,17 @@ private:
+         bool reattack;
+     };
+     void traj_ref_lawnmower_search(OffboardControlMode& mode, const Lawnmower &pattern);
++    void traj_ref_avians(OffboardControlMode& mode);
+ 
+     // Controller variables
+     int lawnmower_leg_;
++    // avians_trajectory: samples of {t, N, E, D, vN, vE, vD} (s from receipt, m and m/s in PX4 local NED),
++    // timed from when the latest trajectory arrived; held position and yaw while there is none
++    static constexpr size_t AVIANS_SAMPLE_SIZE = 7;
++    std::vector<double> avians_traj_;
++    rclcpp::Time avians_traj_t0_;
++    std::array<double, 4> avians_hold_; // N, E, D, yaw
++    double avians_yaw_;
+ 
+     // (optional) PX4 ROS2 Interface Lib support
+     std::unordered_map<std::string, std::unique_ptr<AASMode>> px4_ros2_modes_; // One external mode per controller, keyed by controller name

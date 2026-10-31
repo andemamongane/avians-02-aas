@@ -130,12 +130,6 @@ def cmd_fly(args: argparse.Namespace) -> int:
     pilots_cfg = _load("pilots.yaml")
     pilot_name = args.pilot or pilots_cfg.get("default", "claude")
     control = _control(mission, args)
-    if control == "plan" and args.backend == "aas":
-        # Before anything flies: plans need the avians trajectory controller in
-        # AAS's offboard framework, which is not written yet.
-        print("[avians] plan-ahead control is not available on AAS yet (the trajectory "
-              "controller is still to be built); use --control step, or --backend fake")
-        return 2
     if mission.get("sensor") and control != "plan":
         print("[avians] missions with a sensor (hidden regions) need --control plan: the "
               "step-by-step tools would show the pilot the whole map")

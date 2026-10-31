@@ -133,11 +133,18 @@ class Environment:
         }
 
 
+# PX4's speed limit over the planner's: a drone that falls behind its
+# trajectory (thrust-limited in a hard turn) needs to fly faster than the
+# reference to catch up. With no headroom PX4 clamps the catch-up and the lag
+# stays (17 m at 15 m/s in Gazebo). Tilt has its own headroom (max_tilt_deg).
+SPEED_HEADROOM = 1.2
+
+
 def envelope_params(limits) -> dict[str, float]:
     """The flight envelope as PX4 multicopter parameters, so the autopilot's own
-    limits match what the planner and the arbiter assume."""
+    limits match what the planner and the arbiter assume (speed: with headroom)."""
     out = {
-        "MPC_XY_VEL_MAX": limits.max_speed_ms,
+        "MPC_XY_VEL_MAX": limits.max_speed_ms * SPEED_HEADROOM,
         "MPC_XY_CRUISE": min(limits.max_speed_ms, 12.0),
         "MPC_ACC_HOR_MAX": limits.max_accel_ms2,
         "MPC_ACC_HOR": limits.max_accel_ms2,

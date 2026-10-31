@@ -20,7 +20,7 @@ in signal temporal logic (STL) over a map of polygon regions.
 | Autopilot interface | AAS `px4_interface`, built from the pinned submodule | same |
 | Physics | PX4's built-in SIH (no world, no wind) | Gazebo Harmonic: x500 dynamics, worlds, wind |
 | Mission `environment:` | PX4 parameters and failures only | everything (see "Environment") |
-| Recordings | PX4 `.ulg` | PX4 `.ulg`, Gazebo chase-camera video, Gazebo poses |
+| Recordings | PX4 `.ulg` | PX4 `.ulg`, Gazebo chase and overview videos, Gazebo poses |
 | QGroundControl (display) | QGC on the host, fed by PX4 SIH | AAS ground container |
 | Start with | `./scripts/up.sh` | `./scripts/up_remote.sh` (after AAS) |
 | avians code | identical | identical |
@@ -228,8 +228,16 @@ How fast and hard the drone may fly is the **flight envelope** in
 `config/limits.yaml`: `aggressive` (default; 15 m/s, 7 m/s², 45° tilt, a 150 m
 geofence, to be validated in Gazebo) or `standard` (PX4's defaults). A mission
 can choose one with `envelope:`. Plans are checked point by point against it.
-On AAS, plan-ahead control needs the avians trajectory controller, which is
-not written yet: until then it runs on the fake backend only.
+On AAS, plan-ahead control runs through avians' patch to AAS
+(`docker/aas/avians_plan_ahead.patch`, built into the aircraft image by
+`scripts/aas_plan_ahead.sh`): an `avians_trajectory` controller in
+`px4_offboard` tracks the trajectory avians publishes (PX4 position, velocity
+and acceleration setpoints at 50 Hz), and `px4_interface` gains an
+`offboard_end` topic that ends the offboard action into hover (a cancel would
+abort to 100 m). PX4's speed limit is 1.2x the planner's, so a drone that falls
+behind can catch up; a plan hands back to AAS only once the drone has caught up
+and slowed. If the monitor ends a mission, the drone flies home round solid and
+no-fly regions (back along its own trail where a straight line is not clear).
 
 **Step-by-step (the baseline).** Each tool mirrors one AAS call and blocks until
 the drone arrives, so the drone hovers whenever the model thinks. Kept for
@@ -263,6 +271,7 @@ data/episodes/ep_0004/
 ├── wind.json          # the wind schedule played (t, east, north)
 ├── px4.ulg            # PX4's own flight log
 ├── gazebo.mp4         # chase-camera video (remote machine)
+├── gazebo_overview.mp4 # whole-map camera with the drone's ground track (remote machine)
 ├── gazebo_poses.jsonl # every Gazebo model's pose during the flight (remote machine)
 ├── meta.json          # spec, model, PX4 / px4_msgs / AAS commit, frame origin, usage
 ├── adp.json           # ADP-style action/observation trajectory
@@ -331,9 +340,15 @@ environment:
 
 The flight envelope becomes PX4's own limits too (`MPC_XY_VEL_MAX`,
 `MPC_ACC_HOR_MAX`, `MPC_TILTMAX_AIR`, ...), so the autopilot, the planner and
-the safety arbiter agree. On the remote machine, the map's regions are drawn
-in Gazebo (translucent; `solid: true` regions are real obstacles) and every
-flight is filmed by a chase camera that follows the drone (`gazebo.mp4`).
+the safety arbiter agree. On the remote machine, the world's scenery (the
+shapes in `impalpable_greyness`) is swapped for a plain ground before takeoff
+(`sim.plain_world` in `config/aas.yaml`; the shapes are real obstacles, so
+remove that entry to fly among them), the map's regions are drawn in Gazebo
+like the 2D map (a tinted patch, an outline, a faint volume for the altitude
+band; `solid: true` regions are real obstacles), and every flight is filmed
+twice: by a chase camera that follows the drone (`gazebo.mp4`) and by a fixed
+camera framing the whole map, with the drone's ground track drawn as blue
+discs (`gazebo_overview.mp4`).
 Gazebo work runs through `src/avians/simside/avians_gz.py` inside AAS's
 simulation container.
 
@@ -365,9 +380,9 @@ avians never cancels an AAS action: cancelling makes AAS climb to its abort
 altitude (100 m by default). `hover` and `abort` hold position with a
 reposition instead.
 
-## Remote AAS (written, not yet run)
+## Remote AAS
 
-Everything for the Linux machine is in place but untested there. In order:
+Steps 1-4 run on the Linux machine (October 2026); step 5 is open:
 
 1. **Bring up AAS** with one quad, then avians next to it:
    `cd external/aerial-autonomy-stack/tools_and_docs && NUM_QUADS=1 WORLD=impalpable_greyness ./sim_run.sh`,
@@ -381,10 +396,10 @@ Everything for the Linux machine is in place but untested there. In order:
    during takeoff.
 3. **Simulator plumbing:** `sim.profile: remote` (set by compose.remote.yml):
    PX4 parameters, wind playback, region overlay, chase-camera video, `.ulg`.
-4. **Plan-ahead flight on AAS:** write the `avians_trajectory` controller in
-   AAS's `offboard_control` package (tracks the latest trajectory avians
-   publishes) and the small `px4_interface` patch that ends an offboard action
-   into Loiter without the abort climb; then `AasBackend.follow/end_follow`.
-5. **Tune the aggressive envelope** in Gazebo: x500 top speed, acceleration and
-   tilt, in calm air and in wind; tracking error of plans (planned vs flown
-   path in the plots).
+4. **Plan-ahead flight on AAS:** done (see "Tools the agent gets" above);
+   `scripts/aas_plan_ahead.sh` once after AAS's `sim_build.sh`. The scripted
+   slalom satisfies its spec in Gazebo; median tracking error ~1.2 m.
+5. **Tune the aggressive envelope** in Gazebo: at 7 m/s² the x500 saturates its
+   thrust in the tightest corners and when braking to a stop (overshoots of up
+   to ~17 m); 5-6 m/s² would cost slalom 2-4 s outbound. Still to do: decide,
+   then check in wind.
