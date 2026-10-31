@@ -40,6 +40,20 @@ git clone --recursive <repo-url>
 cd avians-02-aas
 ```
 
+To update an existing clone, from the repo root and on the host (not inside the
+container):
+
+```bash
+git pull
+git submodule update --init --recursive    # match the pinned aerial-autonomy-stack commit
+```
+
+`git pull` alone leaves `external/aerial-autonomy-stack` as it was, so run both.
+Changes to `src/`, `config/`, `missions/` and `maps/` need no rebuild: the
+container mounts them live. If the pull changes `docker/` or `pyproject.toml`,
+or moves the AAS commit, rebuild by rerunning `./scripts/up.sh` (or
+`./scripts/up_remote.sh` on the Linux machine).
+
 Then either open it in VS Code and run **Dev Containers: Reopen in Container**,
 or from a terminal:
 
